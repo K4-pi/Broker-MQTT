@@ -1,5 +1,6 @@
 CXX := g++
-CXXFLAGS := -Wall -Wextra -Wpedantic -std=c++20 -Iinclude
+CXXFLAGS := -Wall -Wextra -Wpedantic -std=c++20 -Iinclude -DDEBUG
+LDLIBS := -lboost_thread -luring -pthread
 SRC_DIR := src
 BUILD_DIR := build
 TARGET := $(BUILD_DIR)/broker-mqtt
@@ -14,7 +15,7 @@ OBJECTS := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(SRC_SOURCES)) \
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
-	$(CXX) $(CXXFLAGS) $^ -o $@
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
