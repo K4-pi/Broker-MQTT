@@ -1,14 +1,18 @@
 #include "broker.hpp"
+#include "packets.hpp"
 #include "error.hpp"
 #include "threadpool/pool.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <string>
 #include <system_error>
 #include <thread>
 
+#include "stdio.h"
 #include "sys/epoll.h"
 #include "sys/socket.h"
 #include "netinet/in.h"
@@ -21,17 +25,11 @@
 namespace broker
 {
     void fd_handler_submit(int client_fd);
-    void process_states();
+    void process_packets();
 
-    constexpr uint16_t STATE_BUFFER_SIZE = 64;
     constexpr uint16_t MAX_EVENTS = 16;
     constexpr uint16_t EPOLL_TIMEOUT_MS = 250;
     constexpr uint16_t RING_ENTRIES = 256;
-
-    struct ConnectionState {
-        int fd;
-        char buffer[STATE_BUFFER_SIZE];
-    };
 
     struct io_uring ring_buffer;
 
@@ -124,7 +122,7 @@ namespace broker
                 }
             } // for
 
-            process_states();
+            process_packets();
         } // while (true)
     }
 
@@ -135,54 +133,111 @@ namespace broker
 
     void fd_handler_submit(int client_fd)
     {
+        constexpr int HEADER_SIZE = 6;
+
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_buffer);
         if (!sqe) return;
 
-        ConnectionState *state = new ConnectionState();
-        state->fd = client_fd;
-        memset(state->buffer, 0, STATE_BUFFER_SIZE);
-        // state->buffer[STATE_BUFFER_SIZE - 1] = '\0';
+        ConnectionPacket *packet = new ConnectionPacket();
+        packet->fd = client_fd;
+        packet->message.offset = 0;
+        packet->message.size = 0;
+        packet->buffer.assign(HEADER_SIZE, 0); // assign 6 because initial header of MQTT (1 byte protocol, 2 - 5 byte message lenght)
 
-        io_uring_prep_recv(sqe, client_fd, state->buffer, STATE_BUFFER_SIZE, 0);
-
-        io_uring_sqe_set_data(sqe, state);
-
+        io_uring_prep_recv(sqe, client_fd, packet->buffer.data(), HEADER_SIZE, 0);
+        io_uring_sqe_set_data(sqe, packet);
         io_uring_submit(&ring_buffer);
     }
 
-    void process_states()
+    void process_packets()
     {
         struct io_uring_cqe *cqe;
 
         while (io_uring_peek_cqe(&ring_buffer, &cqe) == 0)
         {
-            ConnectionState *state = (ConnectionState *)io_uring_cqe_get_data(cqe);
+            ConnectionPacket *packet = (ConnectionPacket *)io_uring_cqe_get_data(cqe);
 
-            bool is_free = true;
-
-            if (cqe->res > 0 && state) // cqe->res > 0 if success, returns number of read bytes like in read()
+            if (cqe->res > 0 && packet) // cqe->res, read bytes
             {
-                #ifdef DEBUG
-                std::cout << state->buffer << "\n";
-                #endif
-
-                /* we suspect that it isn't whole msg so we will
-                 * reuse current state to store next part of the msg */
-                if (cqe->res == STATE_BUFFER_SIZE)
+                if (packet->message.size == 0) // Uninitialized message, read Header
                 {
-                    memset(state->buffer, 0, STATE_BUFFER_SIZE);
+                    packet->message.type = static_cast<PACKET_TYPE>(packet->buffer.at(0) >> 4);
+
+                    size_t message_size = 0;
+                    int byte_idx = 1;
+                    while (byte_idx <= 5)
+                    {
+                        uint8_t size_byte = packet->buffer.at(byte_idx);
+
+                        if (!(size_byte & 100)) break; // Next byte is not length
+                        message_size += (size_byte & 0x7F);
+                        byte_idx++;
+                    }
+
+                    #ifdef DEBUG
+                    std::cout << "message size  = " << message_size + byte_idx << "\n";
+                    std::cout << "message len   = " << message_size << "\n";
+                    std::cout << "message type  = " << packet->message.type << std::endl;
+                    #endif
+
+                    packet->message.size = message_size;
+
+                    if (byte_idx != 5)
+                    {
+                        // Save remaining bytes as message
+                        while (byte_idx <= 5)
+                        {
+                            packet->message.data.push_back(packet->buffer.at(byte_idx));
+                            packet->message.offset++;
+                            byte_idx++;
+                        }
+                    }
+
+                    // Request the next part of a message
+                    packet->buffer.resize(message_size + packet->buffer.size());
 
                     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_buffer);
-                    io_uring_prep_recv(sqe, state->fd, state->buffer, STATE_BUFFER_SIZE, 0);
-                    io_uring_sqe_set_data(sqe, state);
-                    io_uring_submit(&ring_buffer);
-
-                    is_free = false;
+                    if (sqe)
+                    {
+                        io_uring_prep_recv(sqe, packet->fd, packet->buffer.data(), message_size, 0);
+                        io_uring_sqe_set_data(sqe, packet);
+                        io_uring_submit(&ring_buffer);
+                    }
                 }
+                else // Read message
+                {
+                    // TODO: mutex lock
+
+                    auto it = packet->buffer.begin();
+                    packet->message.data.insert(packet->message.data.end(), it, it + packet->message.size - packet->message.offset);
+
+                    // for (size_t idx = 0; idx < packet->message.size - packet->message.offset; idx++)
+                    // {
+                    //     char c = packet->buffer.at(idx);
+
+                    //     if (c == '\n')
+                    //     {
+                    //
+                    //         break;
+                    //     }
+
+                    //     packet->message.data.push_back(c);
+                    // }
+                    #ifdef DEBUG
+                    for (uint8_t b : packet->message.data)
+                    {
+                        printf("%.02X ", b);
+                    }
+                    printf("\n");
+                    #endif
+
+                    // TODO: Respond to message
+
+                    delete packet;
+                } // else
             }
 
-            if (is_free) delete state;
             io_uring_cqe_seen(&ring_buffer, cqe);
         }
-    }   
+    }
 }  // namespace broker
