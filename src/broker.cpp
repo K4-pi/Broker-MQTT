@@ -3,11 +3,14 @@
 #include "error.hpp"
 #include "threadpool/pool.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -21,6 +24,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace broker
 {
@@ -38,7 +42,27 @@ namespace broker
 
     sockaddr_in server_addr;
 
+    std::map<int, ConnectionPacket*> connections; // Key = fd, Value = packet
+
     static boost::threadpool::pool workers(std::thread::hardware_concurrency());
+
+    static inline void request_message(ConnectionPacket *packet, size_t message_size)
+    {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_buffer);
+        if (sqe)
+        {
+            io_uring_prep_recv(
+                sqe,
+                packet->fd,
+                packet->buffer.data(),
+                std::min<std::size_t>(message_size, packet->buffer.size()), // Min so we don't exceed array size
+                0
+            );
+
+            io_uring_sqe_set_data(sqe, packet);
+            io_uring_submit(&ring_buffer);
+        }
+    }
 
     void setup(char *address, int port)
     {
@@ -114,8 +138,11 @@ namespace broker
                         exit(EXIT_FAILURE);
                     }
                 }
-                else
+                else if (!connections.contains(fd)) // prevents sockets from having multiple messages at once
                 {
+                    ConnectionPacket *packet = new ConnectionPacket();
+                    connections.emplace(fd, packet);
+
                     workers.schedule([fd]() {
                         fd_handler_submit(fd);
                     });
@@ -133,20 +160,18 @@ namespace broker
 
     void fd_handler_submit(int client_fd)
     {
-        constexpr int HEADER_SIZE = 6;
+        ConnectionPacket* packet;
+        try
+        {
+            packet = connections.at(client_fd);
+        }
+        catch (const std::out_of_range&) { return; }
 
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_buffer);
-        if (!sqe) return;
-
-        ConnectionPacket *packet = new ConnectionPacket();
         packet->fd = client_fd;
         packet->message.offset = 0;
         packet->message.size = 0;
-        packet->buffer.assign(HEADER_SIZE, 0); // assign 6 because initial header of MQTT (1 byte protocol, 2 - 5 byte message lenght)
 
-        io_uring_prep_recv(sqe, client_fd, packet->buffer.data(), HEADER_SIZE, 0);
-        io_uring_sqe_set_data(sqe, packet);
-        io_uring_submit(&ring_buffer);
+        request_message(packet, 6); // Header size = 6
     }
 
     void process_packets()
@@ -164,15 +189,30 @@ namespace broker
                     packet->message.type = static_cast<PACKET_TYPE>(packet->buffer.at(0) >> 4);
 
                     size_t message_size = 0;
+                    size_t multiplier = 1;
                     int byte_idx = 1;
-                    while (byte_idx <= 5)
-                    {
-                        uint8_t size_byte = packet->buffer.at(byte_idx);
 
-                        if (!(size_byte & 100)) break; // Next byte is not length
-                        message_size += (size_byte & 0x7F);
+                    uint8_t size_byte;
+                    do
+                    {
+                        size_byte = packet->buffer.at(byte_idx);
+
+                        message_size += (size_byte & 0x7F) * multiplier;
                         byte_idx++;
+
+                        multiplier *= 128;
+
+                        if (multiplier > 0x200000)
+                        {
+                            #ifdef DEBUG
+                            std::cout << "Malformed Remaining Length" << std::endl;
+                            #endif
+
+                            delete packet;
+                            return;
+                        }
                     }
+                    while ((size_byte & 0x80));
 
                     #ifdef DEBUG
                     std::cout << "message size  = " << message_size + byte_idx << "\n";
@@ -182,47 +222,25 @@ namespace broker
 
                     packet->message.size = message_size;
 
-                    if (byte_idx != 5)
+                    // Save remaining bytes as message
+                    while (byte_idx <= 5)
                     {
-                        // Save remaining bytes as message
-                        while (byte_idx <= 5)
-                        {
-                            packet->message.data.push_back(packet->buffer.at(byte_idx));
-                            packet->message.offset++;
-                            byte_idx++;
-                        }
+                        packet->message.data.push_back(packet->buffer.at(byte_idx));
+                        packet->message.offset++;
+                        byte_idx++;
                     }
 
                     // Request the next part of a message
-                    packet->buffer.resize(message_size + packet->buffer.size());
-
-                    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_buffer);
-                    if (sqe)
-                    {
-                        io_uring_prep_recv(sqe, packet->fd, packet->buffer.data(), message_size, 0);
-                        io_uring_sqe_set_data(sqe, packet);
-                        io_uring_submit(&ring_buffer);
-                    }
+                    request_message(packet, message_size);
                 }
                 else // Read message
                 {
                     // TODO: mutex lock
 
+                    auto bytes_to_copy = std::min<std::size_t>(packet->buffer.size(), static_cast<std::size_t>(cqe->res));
                     auto it = packet->buffer.begin();
-                    packet->message.data.insert(packet->message.data.end(), it, it + packet->message.size - packet->message.offset);
+                    packet->message.data.insert(packet->message.data.end(), it, it + bytes_to_copy);
 
-                    // for (size_t idx = 0; idx < packet->message.size - packet->message.offset; idx++)
-                    // {
-                    //     char c = packet->buffer.at(idx);
-
-                    //     if (c == '\n')
-                    //     {
-                    //
-                    //         break;
-                    //     }
-
-                    //     packet->message.data.push_back(c);
-                    // }
                     #ifdef DEBUG
                     for (uint8_t b : packet->message.data)
                     {
@@ -233,7 +251,21 @@ namespace broker
 
                     // TODO: Respond to message
 
-                    delete packet;
+                    size_t remaining = std::max(packet->message.size - packet->message.data.size(), (size_t)0);
+                    if (remaining > 0) request_message(packet, remaining);
+                    else
+                    {
+                        throw_if_error(epoll_ctl(epollfd, EPOLL_CTL_DEL, packet->fd, nullptr), "epoll_ctl: del");
+
+                        close(packet->fd);
+                        connections.erase(packet->fd);
+
+                        delete packet;
+
+                        #ifdef DEBUG
+                        std::cout << "client removed" << std::endl;
+                        #endif
+                    }
                 } // else
             }
 

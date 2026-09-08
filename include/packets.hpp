@@ -1,8 +1,11 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+constexpr std::size_t PACKET_BUFFER_SIZE = 8;
 
 enum PACKET_TYPE {
     CONNECT     = 1,
@@ -31,6 +34,6 @@ struct MessageAccumulator {
 
 struct ConnectionPacket {
     int fd;
-    std::vector<uint8_t> buffer; // TODO: Change to fixed size array
+    std::array<uint8_t, PACKET_BUFFER_SIZE> buffer{};
     MessageAccumulator message;
 };
