@@ -28,7 +28,20 @@
 
 namespace broker
 {
+    /**
+     * @brief Fetch connection state for @p client_fd and submit initial read.
+     *
+     * Scheduled by worker threads after an epoll readability event is observed.
+     *
+     * @param client_fd Connected client socket file descriptor.
+     */
     void fd_handler_submit(int client_fd);
+
+    /**
+     * @brief Drain io_uring completion queue and advance packet parsing state.
+     *
+     * Handles both first header chunk and subsequent payload chunks per client.
+     */
     void process_packets();
 
     constexpr uint16_t MAX_EVENTS = 16;
@@ -46,6 +59,12 @@ namespace broker
 
     static boost::threadpool::pool workers(std::thread::hardware_concurrency());
 
+    /**
+     * @brief Submit async recv request for the next message chunk.
+     *
+     * @param packet Per-connection packet state to associate with completion.
+     * @param message_size Requested number of bytes to read (capped to buffer size).
+     */
     static inline void request_message(ConnectionPacket *packet, size_t message_size)
     {
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_buffer);
@@ -64,6 +83,12 @@ namespace broker
         }
     }
 
+    /**
+     * @brief Configure listening socket, epoll, and io_uring resources.
+     *
+     * @param address IPv4 bind address in text form.
+     * @param port TCP bind port.
+     */
     void setup(char *address, int port)
     {
         try
@@ -100,6 +125,9 @@ namespace broker
         }
     }
 
+    /**
+     * @brief Run the main broker loop with I/O handling.
+     */
     void start()
     {
         socklen_t server_addr_len = sizeof(server_addr);
@@ -153,6 +181,9 @@ namespace broker
         } // while (true)
     }
 
+    /**
+     * @brief Print info.
+     */
     void print_info()
     {
         std::cout << "Broker-MQTT, Hello World!" << std::endl;
