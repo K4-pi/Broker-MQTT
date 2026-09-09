@@ -273,8 +273,6 @@ namespace broker
                 }
                 else // Read message
                 {
-                    // TODO: mutex lock
-
                     auto bytes_to_copy = std::min<std::size_t>(packet->buffer.size(), static_cast<std::size_t>(cqe->res));
                     auto it = packet->buffer.begin();
                     packet->message.data.insert(packet->message.data.end(), it, it + bytes_to_copy);
