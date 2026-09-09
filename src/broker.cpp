@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -56,6 +57,7 @@ namespace broker
     sockaddr_in server_addr;
 
     std::map<int, ConnectionPacket*> connections; // Key = fd, Value = packet
+    std::mutex connections_mutex;
 
     static boost::threadpool::pool workers(std::thread::hardware_concurrency());
 
@@ -166,10 +168,14 @@ namespace broker
                         exit(EXIT_FAILURE);
                     }
                 }
-                else if (!connections.contains(fd)) // prevents sockets from having multiple messages at once
+                else
                 {
-                    ConnectionPacket *packet = new ConnectionPacket();
-                    connections.emplace(fd, packet);
+                    {
+                        std::lock_guard<std::mutex> lock(connections_mutex);
+
+                        if (connections.contains(fd)) continue; // prevents sockets from having multiple messages at once
+                        connections.emplace(fd, new ConnectionPacket());
+                    }
 
                     workers.schedule([fd]() {
                         fd_handler_submit(fd);
@@ -194,6 +200,7 @@ namespace broker
         ConnectionPacket* packet;
         try
         {
+            std::lock_guard<std::mutex> lock(connections_mutex);
             packet = connections.at(client_fd);
         }
         catch (const std::out_of_range&) { return; }
@@ -289,8 +296,10 @@ namespace broker
                         throw_if_error(epoll_ctl(epollfd, EPOLL_CTL_DEL, packet->fd, nullptr), "epoll_ctl: del");
 
                         close(packet->fd);
-                        connections.erase(packet->fd);
-
+                        {
+                            std::lock_guard<std::mutex> lock(connections_mutex);
+                            connections.erase(packet->fd);
+                        }
                         delete packet;
 
                         #ifdef DEBUG
