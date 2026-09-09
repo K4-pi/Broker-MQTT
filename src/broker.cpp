@@ -3,6 +3,9 @@
 #include "error.hpp"
 #include "threadpool/pool.hpp"
 
+#define BOOST_JSON_STACK_BUFFER_SIZE 1024
+#include <boost/json/src.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -83,6 +86,26 @@ namespace broker
             io_uring_sqe_set_data(sqe, packet);
             io_uring_submit(&ring_buffer);
         }
+    }
+
+    /**
+     * @brief Disconnects client from a server.
+     *
+     * @param client_fd client connection file descriptor.
+     */
+    static void disconnect_client(int client_fd)
+    {
+        throw_if_error(epoll_ctl(epollfd, EPOLL_CTL_DEL, client_fd, nullptr), "epoll_ctl: del");
+
+        close(client_fd);
+        {
+            std::lock_guard<std::mutex> lock(connections_mutex);
+            connections.erase(client_fd);
+        }
+
+        #ifdef DEBUG
+        std::cout << "client disconnected" << std::endl;
+        #endif
     }
 
     /**
@@ -291,18 +314,8 @@ namespace broker
                     if (remaining > 0) request_message(packet, remaining);
                     else
                     {
-                        throw_if_error(epoll_ctl(epollfd, EPOLL_CTL_DEL, packet->fd, nullptr), "epoll_ctl: del");
-
-                        close(packet->fd);
-                        {
-                            std::lock_guard<std::mutex> lock(connections_mutex);
-                            connections.erase(packet->fd);
-                        }
+                        disconnect_client(packet->fd);
                         delete packet;
-
-                        #ifdef DEBUG
-                        std::cout << "client removed" << std::endl;
-                        #endif
                     }
                 } // else
             }
