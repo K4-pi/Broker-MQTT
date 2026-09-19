@@ -1,5 +1,8 @@
 CXX := g++
-CXXFLAGS := -Wall -Wextra -Wpedantic -std=c++20 -Iinclude -DDEBUG
+CXXFLAGS := -Wall -Wextra -Wpedantic -std=c++20 -Iinclude -DDEBUG \
+	-DBOOST_BIND_GLOBAL_PLACEHOLDERS \
+	-Wno-volatile \
+	-Wno-catch-value
 LDLIBS := -lboost_thread -luring -pthread
 SRC_DIR := src
 BUILD_DIR := build
