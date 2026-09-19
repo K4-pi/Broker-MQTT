@@ -8,6 +8,7 @@
 constexpr std::size_t PACKET_BUFFER_SIZE = 1024;
 
 enum PACKET_TYPE {
+    NONE        = 0,
     CONNECT     = 1,
     CONNACK     = 2,
     PUBLISH     = 3,
@@ -25,6 +26,14 @@ enum PACKET_TYPE {
     AUTH        = 15
 };
 
+enum MESSAGE_STATUS {
+    OK,
+    FINISHED,
+    INVALID_VALUE,
+    INVALID_TYPE,
+    SECOND_CONNECT
+};
+
 struct MessageAccumulator {
     PACKET_TYPE type;
     uint8_t offset;
@@ -34,6 +43,9 @@ struct MessageAccumulator {
 
 struct ConnectionPacket {
     int fd;
+    bool initialized = false;
     std::array<uint8_t, PACKET_BUFFER_SIZE> buffer{};
     MessageAccumulator message;
 };
+
+MESSAGE_STATUS handle_message_data(int client_fd, MessageAccumulator *message);

@@ -3,9 +3,6 @@
 #include "error.hpp"
 #include "threadpool/pool.hpp"
 
-#define BOOST_JSON_STACK_BUFFER_SIZE 1024
-#include <boost/json/src.hpp>
-
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -19,16 +16,20 @@
 #include <system_error>
 #include <thread>
 
-#include "stdio.h"
 #include "sys/epoll.h"
 #include "sys/socket.h"
 #include "netinet/in.h"
 #include "linux/io_uring.h"
 #include "liburing.h"
+
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef DEBUG
+#include "stdio.h"
+#endif
 
 namespace broker
 {
@@ -51,6 +52,7 @@ namespace broker
     constexpr uint16_t MAX_EVENTS = 16;
     constexpr uint16_t EPOLL_TIMEOUT_MS = 250;
     constexpr uint16_t RING_ENTRIES = 256;
+    constexpr uint8_t MQTT_MESSAGE_HEADER_SIZE = 6; // MQTT max header size = 6
 
     struct io_uring ring_buffer;
 
@@ -215,9 +217,14 @@ namespace broker
      */
     void print_info()
     {
-        std::cout << "Broker-MQTT, Hello World!" << std::endl;
+        std::cout << "Broker-MQTT, started!" << std::endl;
     }
 
+    /**
+     * @brief Handle new fd client.
+     *
+     * @param client_fd file descriptor of new client.
+     */
     void fd_handler_submit(int client_fd)
     {
         ConnectionPacket* packet;
@@ -232,20 +239,70 @@ namespace broker
         packet->message.offset = 0;
         packet->message.size = 0;
 
-        request_message(packet, 6); // Header size = 6
+        request_message(packet, MQTT_MESSAGE_HEADER_SIZE);
     }
 
+    /**
+     * @brief Take actions based on ongoing message allocation.
+     *
+     * @param packet pointer to packet with processed message.
+     * @param cqe IO Completion Queue Entry
+     */
+    void process_message(ConnectionPacket *packet, io_uring_cqe *cqe)
+    {
+        auto bytes_to_copy = std::min<std::size_t>(packet->buffer.size(), static_cast<std::size_t>(cqe->res));
+        auto it = packet->buffer.begin();
+        packet->message.data.insert(packet->message.data.end(), it, it + bytes_to_copy);
+
+        #ifdef DEBUG
+        for (uint8_t b : packet->message.data) printf("%.02X ", b);
+        printf("\n");
+        #endif
+
+        size_t remaining = (packet->message.size > 0) ? (packet->message.size - packet->message.data.size()) : 0;
+        #ifdef DEBUG
+        std::cout << "remaining size = " << remaining << std::endl;
+        #endif
+
+        if (remaining > 0) request_message(packet, remaining);
+        else
+        {
+            MESSAGE_STATUS status = handle_message_data(packet->fd, &packet->message);
+            if (status == OK)
+            {
+                packet->message.data.clear();
+                packet->message.size = 0;
+                packet->message.offset = 0;
+                packet->initialized = false;
+
+                request_message(packet, MQTT_MESSAGE_HEADER_SIZE);
+            }
+            else
+            {
+                #ifdef DEBUG
+                if (status == FINISHED) std::cout << "Client disconnected normally"   << std::endl;
+                else if (status != OK)  std::cout << "Client disconnected with error" << std::endl;
+                #endif
+
+                disconnect_client(packet->fd);
+                delete packet;
+            }
+        }
+    }
+
+    /**
+     * @brief Process packets in IO Completion Queue Entry.
+     */
     void process_packets()
     {
         struct io_uring_cqe *cqe;
-
         while (io_uring_peek_cqe(&ring_buffer, &cqe) == 0)
         {
             ConnectionPacket *packet = (ConnectionPacket *)io_uring_cqe_get_data(cqe);
 
             if (cqe->res > 0 && packet) // cqe->res, read bytes
             {
-                if (packet->message.size == 0) // Uninitialized message, read Header
+                if (!packet->initialized) // Uninitialized message, read Header
                 {
                     packet->message.type = static_cast<PACKET_TYPE>(packet->buffer.at(0) >> 4);
 
@@ -276,6 +333,7 @@ namespace broker
                     while ((size_byte & 0x80));
 
                     #ifdef DEBUG
+                    std::cout << "\nNEW MESSAGE\n";
                     std::cout << "message size  = " << message_size + byte_idx << "\n";
                     std::cout << "message len   = " << message_size << "\n";
                     std::cout << "message type  = " << packet->message.type << std::endl;
@@ -284,40 +342,23 @@ namespace broker
                     packet->message.size = message_size;
 
                     // Save remaining bytes as message
-                    while (byte_idx <= 5)
+                    while (byte_idx < MQTT_MESSAGE_HEADER_SIZE)
                     {
                         packet->message.data.push_back(packet->buffer.at(byte_idx));
                         packet->message.offset++;
                         byte_idx++;
                     }
 
+                    packet->initialized = true;
+
                     // Request the next part of a message
-                    request_message(packet, message_size);
+                    if (message_size > 0) request_message(packet, message_size);
+                    else process_message(packet, cqe);
                 }
                 else // Read message
                 {
-                    auto bytes_to_copy = std::min<std::size_t>(packet->buffer.size(), static_cast<std::size_t>(cqe->res));
-                    auto it = packet->buffer.begin();
-                    packet->message.data.insert(packet->message.data.end(), it, it + bytes_to_copy);
-
-                    #ifdef DEBUG
-                    for (uint8_t b : packet->message.data)
-                    {
-                        printf("%.02X ", b);
-                    }
-                    printf("\n");
-                    #endif
-
-                    // TODO: Respond to message
-
-                    size_t remaining = std::max(packet->message.size - packet->message.data.size(), (size_t)0);
-                    if (remaining > 0) request_message(packet, remaining);
-                    else
-                    {
-                        disconnect_client(packet->fd);
-                        delete packet;
-                    }
-                } // else
+                    process_message(packet, cqe);
+                }
             }
 
             io_uring_cqe_seen(&ring_buffer, cqe);
