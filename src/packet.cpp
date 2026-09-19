@@ -29,6 +29,12 @@ static MESSAGE_STATUS MQTT_connect(int fd)
     return OK;
 }
 
+/**
+ * @brief Ping MQTT 3.1.1 PINGREQ packet.
+ *
+ * @param fd Client socket file descriptor.
+ * @return MESSAGE_STATUS OK on success, INVALID_VALUE on send failure.
+ */
 static MESSAGE_STATUS MQTT_ping(int fd)
 {
     // PINGRESP: packet type (0xD0), remaining length (0x00)
@@ -44,6 +50,12 @@ static MESSAGE_STATUS MQTT_ping(int fd)
     return OK;
 }
 
+/**
+ * @brief Process assembled MQTT message.
+ *
+ * @param client_fd Client socket file descriptor.
+ * @return message pointer to handled message.
+ */
 MESSAGE_STATUS handle_message_data(int client_fd, MessageAccumulator *message)
 {
     if (!message) return INVALID_VALUE;
