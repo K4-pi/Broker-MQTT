@@ -207,8 +207,6 @@ namespace broker
         setup(address, port, &listen_sock, &server_addr, &ring_buffer, &e_data);
 
         static boost::threadpool::pool workers(std::thread::hardware_concurrency());
-        // std::map<int, ConnectionPacket*> connections; // Key = fd, Value = packet
-        // std::mutex connections_mutex;
         struct connection_registry connections;
 
         while (true)
