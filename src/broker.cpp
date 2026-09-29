@@ -227,10 +227,11 @@ namespace broker
                 int fd = e_data.events[n].data.fd;
                 if (fd == listen_sock)
                 {
+                    int connection_sock;
                     try
                     {
                         socklen_t server_addr_len = sizeof(server_addr);
-                        int connection_sock = accept4(listen_sock, (struct sockaddr *) &server_addr, &server_addr_len, SOCK_NONBLOCK);
+                        connection_sock = accept4(listen_sock, (struct sockaddr *) &server_addr, &server_addr_len, SOCK_NONBLOCK);
                         throw_if_error(connection_sock, "accept4");
 
                         e_data.event.events = EPOLLIN | EPOLLET;
@@ -240,7 +241,10 @@ namespace broker
                     catch (const std::system_error &e)
                     {
                         std::cout << e.what() << "\n";
-                        exit(EXIT_FAILURE);
+
+                        // Close socket if accept4 succeded but epoll failed
+                        if (connection_sock != -1) close(connection_sock);
+                        continue;
                     }
                 }
                 else
