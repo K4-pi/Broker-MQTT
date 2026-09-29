@@ -4,9 +4,7 @@ int main()
 {
     broker::print_info();
 
-    broker::setup((char*)"0.0.0.0", 8888);
-
-    broker::start();
+    broker::start((char*)"0.0.0.0", 8888);
 
     return 0;
 }
