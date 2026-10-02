@@ -1,4 +1,5 @@
 build/
 compile_commands.json
-mqtt_basic_test.py
+tests
 __pycache__/
+.zed
