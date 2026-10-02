@@ -5,13 +5,17 @@
 
 #include <algorithm>
 #include <array>
+#include <asm-generic/socket.h>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -25,6 +29,7 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 #ifdef DEBUG
 #include "stdio.h"
@@ -40,7 +45,7 @@ namespace broker
     /**
      * Better way to store epoll status variables
      */
-    struct epoll_data
+    struct epoll_registry_t
     {
         int epollfd;
         struct epoll_event event;
@@ -76,7 +81,7 @@ namespace broker
      */
     void process_packets(
         struct io_uring *ring_buffer,
-        struct epoll_data *e_data,
+        struct epoll_registry_t *epoll_registry,
         struct connection_registry *connections
     );
 
@@ -95,7 +100,12 @@ namespace broker
         int listen_sock,
         sockaddr_in* server_addr,
         struct io_uring *ring_buffer,
-        struct epoll_data *e_data
+        struct epoll_registry_t *epoll_registry
+    );
+
+    void manage_packet_live_time(
+        epoll_registry_t *epoll_registry,
+        connection_registry *connections
     );
 
     /**
@@ -132,11 +142,11 @@ namespace broker
      */
     static void disconnect_client(
         int client_fd,
-        struct epoll_data *e_data,
+        struct epoll_registry_t *epoll_registry,
         struct connection_registry *connections
     )
     {
-        throw_if_error(epoll_ctl(e_data->epollfd, EPOLL_CTL_DEL, client_fd, nullptr), "epoll_ctl: del");
+        epoll_ctl(epoll_registry->epollfd, EPOLL_CTL_DEL, client_fd, nullptr);
         close(client_fd);
         {
             std::lock_guard<std::mutex> lock(connections->mutex);
@@ -161,7 +171,7 @@ namespace broker
         int *listen_sock,
         sockaddr_in *server_addr,
         struct io_uring *ring_buffer,
-        struct epoll_data *e_data
+        struct epoll_registry_t *epoll_registry
     )
     {
         try
@@ -177,16 +187,16 @@ namespace broker
             throw_if_error(bind(*listen_sock, (sockaddr *)server_addr, sizeof(*server_addr)), "bind: listen_sock");
             throw_if_error(listen(*listen_sock, 8), "listen");
 
-            e_data->epollfd = epoll_create1(0);
-            throw_if_error(e_data->epollfd, "epoll_create1");
+            epoll_registry->epollfd = epoll_create1(0);
+            throw_if_error(epoll_registry->epollfd, "epoll_create1");
 
             int ring_init_rc = io_uring_queue_init(RING_ENTRIES, ring_buffer, 0);
             if (ring_init_rc < 0)
                 throw std::system_error(-ring_init_rc, std::generic_category(), "io_uring_queue_init");
 
-            e_data->event.events = EPOLLIN;
-            e_data->event.data.fd = *listen_sock;
-            throw_if_error(epoll_ctl(e_data->epollfd, EPOLL_CTL_ADD, *listen_sock, &e_data->event), "epoll_ctl: listen_sock");
+            epoll_registry->event.events = EPOLLIN;
+            epoll_registry->event.data.fd = *listen_sock;
+            throw_if_error(epoll_ctl(epoll_registry->epollfd, EPOLL_CTL_ADD, *listen_sock, &epoll_registry->event), "epoll_ctl: listen_sock");
         } // try
         catch (const std::system_error &e)
         {
@@ -203,28 +213,30 @@ namespace broker
         int listen_sock;
         struct sockaddr_in server_addr;
         struct io_uring ring_buffer;
-        struct epoll_data e_data;
-        setup(address, port, &listen_sock, &server_addr, &ring_buffer, &e_data);
+        struct epoll_registry_t epoll_registry;
+        setup(address, port, &listen_sock, &server_addr, &ring_buffer, &epoll_registry);
 
         static boost::threadpool::pool workers(std::thread::hardware_concurrency());
         struct connection_registry connections;
 
         while (true)
         {
-            int nfds = epoll_wait(e_data.epollfd, e_data.events, MAX_EVENTS, EPOLL_TIMEOUT_MS);
+            manage_packet_live_time(&epoll_registry, &connections);
+
+            int nfds = epoll_wait(epoll_registry.epollfd, epoll_registry.events, MAX_EVENTS, EPOLL_TIMEOUT_MS);
             try
             {
                 throw_if_error(nfds, "epoll_wait");
             }
             catch (const std::system_error &e)
             {
-                std::cout << e.what() << "\n";
+                std::cerr << e.what() << std::endl;
                 exit(EXIT_FAILURE);
             }
 
             for (int n = 0; n < nfds; ++n)
             {
-                int fd = e_data.events[n].data.fd;
+                int fd = epoll_registry.events[n].data.fd;
                 if (fd == listen_sock)
                 {
                     int connection_sock;
@@ -234,13 +246,13 @@ namespace broker
                         connection_sock = accept4(listen_sock, (struct sockaddr *) &server_addr, &server_addr_len, SOCK_NONBLOCK);
                         throw_if_error(connection_sock, "accept4");
 
-                        e_data.event.events = EPOLLIN | EPOLLET;
-                        e_data.event.data.fd = connection_sock;
-                        throw_if_error(epoll_ctl(e_data.epollfd, EPOLL_CTL_ADD, connection_sock, &e_data.event), "epoll_ctl: connection_sock");
+                        epoll_registry.event.events = EPOLLIN | EPOLLET;
+                        epoll_registry.event.data.fd = connection_sock;
+                        throw_if_error(epoll_ctl(epoll_registry.epollfd, EPOLL_CTL_ADD, connection_sock, &epoll_registry.event), "epoll_ctl: connection_sock");
                     }
                     catch (const std::system_error &e)
                     {
-                        std::cout << e.what() << "\n";
+                        std::cerr << e.what() << std::endl;
 
                         // Close socket if accept4 succeded but epoll failed
                         if (connection_sock != -1) close(connection_sock);
@@ -252,8 +264,14 @@ namespace broker
                     {
                         std::lock_guard<std::mutex> lock(connections.mutex);
 
-                        if (connections.entries.contains(fd)) continue; // prevents sockets from having multiple messages at once
-                        connections.entries.emplace(fd, new ConnectionPacket());
+                        // if packet is not already there, we create new one
+                        if (!connections.entries.contains(fd))
+                        {
+                            ConnectionPacket *packet = new ConnectionPacket();
+                            packet->keep_alive = std::chrono::steady_clock::now();
+
+                            if (packet) connections.entries.emplace(fd, packet);
+                        }
                     }
 
                     workers.schedule([fd, &ring_buffer, &connections]() {
@@ -261,8 +279,7 @@ namespace broker
                     });
                 }
             } // for
-
-            process_packets(&ring_buffer, &e_data, &connections);
+            process_packets(&ring_buffer, &epoll_registry, &connections);
         } // while (true)
     }
 
@@ -284,6 +301,12 @@ namespace broker
         struct io_uring *ring_buffer,
         struct connection_registry *connections)
     {
+        /* TODO:
+         * Needs change, we should check if user is already connected,
+         * if yes then we should access packet in hash map and request message for it
+         * and not create new ConnectionPacket
+         */
+
         ConnectionPacket* packet;
         try
         {
@@ -308,7 +331,7 @@ namespace broker
         ConnectionPacket *packet,
         io_uring_cqe *cqe,
         struct io_uring *ring_buffer,
-        struct epoll_data *e_data,
+        struct epoll_registry_t *epoll_registry,
         struct connection_registry *connections
     )
     {
@@ -327,23 +350,27 @@ namespace broker
         else
         {
             MESSAGE_STATUS status = handle_message_data(packet->fd, &packet->message);
-            if (status == OK)
-            {
-                packet->message.data.clear();
-                packet->message.size = 0;
-                packet->message.offset = 0;
-                packet->initialized = false;
-                request_message(packet, MQTT_MESSAGE_HEADER_SIZE, ring_buffer);
-            }
-            else
-            {
-                #ifdef DEBUG
-                if (status == FINISHED) std::cout << "Client disconnected normally"   << std::endl;
-                else if (status != OK)  std::cout << "Client disconnected with error" << std::endl;
-                #endif
+            switch (status) {
+                case OK: // Just clear packet for next possible message
+                    packet->message.data.clear();
+                    packet->message.size = 0;
+                    packet->message.offset = 0;
+                    packet->initialized = false;
+                    break;
 
-                disconnect_client(packet->fd, e_data, connections);
-                delete packet;
+                case FAILURE: // Disconnect on failure
+                    disconnect_client(packet->fd, epoll_registry, connections);
+                    delete packet;
+                    break;
+            };
+        }
+        if (packet)
+        {
+            struct io_uring_sqe *sqe = io_uring_get_sqe(ring_buffer);
+            if (sqe)
+            {
+                io_uring_sqe_set_data(sqe, packet);
+                io_uring_submit(ring_buffer);
             }
         }
     }
@@ -353,7 +380,7 @@ namespace broker
      */
     void process_packets(
         struct io_uring *ring_buffer,
-        struct epoll_data *e_data,
+        struct epoll_registry_t *epoll_registry,
         struct connection_registry *connections
     )
     {
@@ -365,6 +392,7 @@ namespace broker
             {
                 if (!packet->initialized) // Uninitialized message, read Header
                 {
+                    packet->keep_alive = std::chrono::steady_clock::now();
                     packet->message.type = static_cast<PACKET_TYPE>(packet->buffer.at(0) >> 4);
 
                     size_t message_size = 0;
@@ -411,14 +439,39 @@ namespace broker
 
                     // Request the next part of a message
                     if (message_size > 0) request_message(packet, message_size, ring_buffer);
-                    else process_message(packet, cqe, ring_buffer, e_data, connections);
+                    else process_message(packet, cqe, ring_buffer, epoll_registry, connections);
                 }
                 else // Read message
                 {
-                    process_message(packet, cqe, ring_buffer, e_data, connections);
+                    process_message(packet, cqe, ring_buffer, epoll_registry, connections);
                 }
             } // if
             io_uring_cqe_seen(ring_buffer, cqe);
         } // while
     }
+
+    void manage_packet_live_time(
+        epoll_registry_t *epoll_registry,
+        connection_registry *connections
+    )
+    {
+        std::vector<ConnectionPacket*> expired_packets = std::vector<ConnectionPacket*>();
+
+        // Measure connectons Keep Alive
+        {
+            std::lock_guard<std::mutex> lock(connections->mutex);
+            for (auto &[fd, packet] : connections->entries)
+                if (!check_keep_alive(packet)) expired_packets.push_back(packet);
+        }
+
+        if (!expired_packets.empty())
+        {
+            for (auto &packet : expired_packets)
+            {
+                disconnect_client(packet->fd, epoll_registry, connections);
+                delete packet;
+            }
+        }
+    }
+
 }  // namespace broker

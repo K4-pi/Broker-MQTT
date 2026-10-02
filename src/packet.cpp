@@ -7,6 +7,20 @@
 #include "stdio.h"
 #endif
 
+constexpr int KEEP_ALIVE_TIME_SEC = 10;
+
+bool check_keep_alive(ConnectionPacket *packet)
+{
+    std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds> (end - packet->keep_alive).count();
+
+    #ifdef DEBUG
+    printf("Elapsed = %ld\n", elapsed);
+    #endif
+
+    return (elapsed >= KEEP_ALIVE_TIME_SEC) ? false : true;
+}
+
 /**
  * @brief Send MQTT 3.1.1 CONNACK packet.
  *
@@ -20,7 +34,7 @@ static MESSAGE_STATUS MQTT_connect(int fd)
     constexpr std::uint8_t connack[] = {0x20, 0x02, 0x00, 0x00};
 
     const ssize_t sent = send(fd, connack, sizeof(connack), 0);
-    if (sent != static_cast<ssize_t>(sizeof(connack))) return INVALID_VALUE;
+    if (sent != static_cast<ssize_t>(sizeof(connack))) return FAILURE;
 
     #ifdef DEBUG
     printf("Sent CONNACK\n");
@@ -41,7 +55,7 @@ static MESSAGE_STATUS MQTT_ping(int fd)
     constexpr std::uint8_t pingresp[] = {0xD0, 0x00};
 
     const ssize_t sent = send(fd, pingresp, sizeof(pingresp), 0);
-    if (sent != static_cast<ssize_t>(sizeof(pingresp))) return INVALID_VALUE;
+    if (sent != static_cast<ssize_t>(sizeof(pingresp))) return FAILURE;
 
     #ifdef DEBUG
     printf("Sent PINGRESP\n");
@@ -58,7 +72,7 @@ static MESSAGE_STATUS MQTT_ping(int fd)
  */
 MESSAGE_STATUS handle_message_data(int client_fd, MessageAccumulator *message)
 {
-    if (!message) return INVALID_VALUE;
+    if (!message) return FAILURE;
 
     switch (message->type)
     {
@@ -69,9 +83,9 @@ MESSAGE_STATUS handle_message_data(int client_fd, MessageAccumulator *message)
             return MQTT_ping(client_fd);
 
         case DISCONNECT:
-            return FINISHED;
+            return FAILURE;
 
         default:
-            return INVALID_TYPE;
+            return FAILURE;
     }
 }

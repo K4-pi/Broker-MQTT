@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -28,10 +29,7 @@ enum PACKET_TYPE {
 
 enum MESSAGE_STATUS {
     OK,
-    FINISHED,
-    INVALID_VALUE,
-    INVALID_TYPE,
-    SECOND_CONNECT
+    FAILURE
 };
 
 struct MessageAccumulator {
@@ -46,6 +44,8 @@ struct ConnectionPacket {
     bool initialized = false;
     std::array<uint8_t, PACKET_BUFFER_SIZE> buffer{};
     MessageAccumulator message;
+    std::chrono::time_point<std::chrono::steady_clock> keep_alive;
 };
 
 MESSAGE_STATUS handle_message_data(int client_fd, MessageAccumulator *message);
+bool check_keep_alive(ConnectionPacket *packet);
