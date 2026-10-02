@@ -2,9 +2,9 @@
 
 int main()
 {
-    broker::print_info();
+    broker::PrintInfo();
 
-    broker::start((char*)"0.0.0.0", 8888);
+    broker::Start((char*)"0.0.0.0", 8888);
 
     return 0;
 }

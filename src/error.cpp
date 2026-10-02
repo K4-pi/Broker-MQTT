@@ -3,15 +3,17 @@
 #include <system_error>
 #include <cerrno>
 
+void ThrowIfError(int returnCode, const std::string &description, int badCode);
+
 /**
  * @brief Throw a system error when a call result indicates failure.
  *
- * @param return_code Value returned by a checked operation.
+ * @param returnCode Value returned by a checked operation.
  * @param description Context string for the thrown error.
- * @param bad_code Sentinel return value treated as failure.
+ * @param badCode Sentinel return value treated as failure.
  */
-void throw_if_error(int return_code, const std::string &description, int bad_code)
+void ThrowIfError(int returnCode, const std::string &description, int badCode)
 {
-    if (return_code == bad_code)
+    if (returnCode == badCode)
         throw std::system_error(errno, std::generic_category(), description);
 }

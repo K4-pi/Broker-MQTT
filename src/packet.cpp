@@ -7,18 +7,29 @@
 #include "stdio.h"
 #endif
 
-constexpr int KEEP_ALIVE_TIME_SEC = 10;
+constexpr int keepAliveTimeSec = 10;
 
-bool check_keep_alive(ConnectionPacket *packet)
+bool CheckKeepAlive(connection_packet_t *packet);
+static MESSAGE_STATUS MqttConnect(int fd);
+static MESSAGE_STATUS MqttPing(int fd);
+MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message);
+
+/**
+ * @brief Check Keep Alive time of a packet.
+ *
+ * @param packet Packet which has to be checked.
+ * @return bool true if didn't excedeed Keep Alive time, false when exceeded.
+ */
+bool CheckKeepAlive(connection_packet_t *packet)
 {
     std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds> (end - packet->keep_alive).count();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds> (end - packet->keepAlive).count();
 
     #ifdef DEBUG
     printf("Elapsed = %ld\n", elapsed);
     #endif
 
-    return (elapsed >= KEEP_ALIVE_TIME_SEC) ? false : true;
+    return (elapsed >= keepAliveTimeSec) ? false : true;
 }
 
 /**
@@ -27,7 +38,7 @@ bool check_keep_alive(ConnectionPacket *packet)
  * @param fd Client socket file descriptor.
  * @return MESSAGE_STATUS OK on success, INVALID_VALUE on send failure.
  */
-static MESSAGE_STATUS MQTT_connect(int fd)
+static MESSAGE_STATUS MqttConnect(int fd)
 {
     // CONNACK: packet type (0x20), remaining length (0x02)
     // connect acknowledge flags (0x00), reason code success (0x00)
@@ -49,7 +60,7 @@ static MESSAGE_STATUS MQTT_connect(int fd)
  * @param fd Client socket file descriptor.
  * @return MESSAGE_STATUS OK on success, INVALID_VALUE on send failure.
  */
-static MESSAGE_STATUS MQTT_ping(int fd)
+static MESSAGE_STATUS MqttPing(int fd)
 {
     // PINGRESP: packet type (0xD0), remaining length (0x00)
     constexpr std::uint8_t pingresp[] = {0xD0, 0x00};
@@ -67,20 +78,20 @@ static MESSAGE_STATUS MQTT_ping(int fd)
 /**
  * @brief Process assembled MQTT message.
  *
- * @param client_fd Client socket file descriptor.
+ * @param clientFd Client socket file descriptor.
  * @return message pointer to handled message.
  */
-MESSAGE_STATUS handle_message_data(int client_fd, MessageAccumulator *message)
+MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message)
 {
     if (!message) return FAILURE;
 
     switch (message->type)
     {
         case CONNECT:
-            return MQTT_connect(client_fd);
+            return MqttConnect(clientFd);
 
         case PINGREQ:
-            return MQTT_ping(client_fd);
+            return MqttPing(clientFd);
 
         case DISCONNECT:
             return FAILURE;

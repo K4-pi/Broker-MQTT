@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-constexpr std::size_t PACKET_BUFFER_SIZE = 1024;
+constexpr std::size_t packetBufferSize = 1024;
 
 enum PACKET_TYPE {
     NONE        = 0,
@@ -32,20 +32,20 @@ enum MESSAGE_STATUS {
     FAILURE
 };
 
-struct MessageAccumulator {
+struct message_accumulator_t {
     PACKET_TYPE type;
     uint8_t offset;
     size_t size;
     std::vector<uint8_t> data;
 };
 
-struct ConnectionPacket {
+struct connection_packet_t {
     int fd;
     bool initialized = false;
-    std::array<uint8_t, PACKET_BUFFER_SIZE> buffer{};
-    MessageAccumulator message;
-    std::chrono::time_point<std::chrono::steady_clock> keep_alive;
+    std::array<uint8_t, packetBufferSize> buffer{};
+    message_accumulator_t message;
+    std::chrono::time_point<std::chrono::steady_clock> keepAlive;
 };
 
-MESSAGE_STATUS handle_message_data(int client_fd, MessageAccumulator *message);
-bool check_keep_alive(ConnectionPacket *packet);
+MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message);
+bool CheckKeepAlive(connection_packet_t *packet);
