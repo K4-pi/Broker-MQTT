@@ -163,6 +163,9 @@ namespace broker
 
             *listenSock = socket(AF_INET, SOCK_STREAM, 0);
             ThrowIfError(*listenSock, "listen_sock");
+
+            const int enable = 1;
+            setsockopt(*listenSock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
             ThrowIfError(bind(*listenSock, (sockaddr *)serverAddr, sizeof(*serverAddr)), "bind: listen_sock");
             ThrowIfError(listen(*listenSock, 8), "listen");
 
