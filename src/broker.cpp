@@ -17,6 +17,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <sys/types.h>
 #include <system_error>
 #include <thread>
 
@@ -64,6 +65,7 @@ namespace broker
         struct epoll_registry_t *epollRegistry,
         struct connection_registry_t *connections
     );
+    ssize_t DecodeMessageLength(connection_packet_t *packet);
     void ManagePacketLiveTime(
         epoll_registry_t *epollRegistry,
         connection_registry_t *connections
@@ -388,50 +390,17 @@ namespace broker
                     packet->keepAlive = std::chrono::steady_clock::now();
                     packet->message.type = static_cast<PACKET_TYPE>(packet->buffer.at(0) >> 4);
 
-                    size_t messageSize = 0;
-                    size_t multiplier = 1;
-                    int byteIdx = 1;
-
-                    uint8_t sizeByte;
-                    do
+                    ssize_t messageSize = DecodeMessageLength(packet);
+                    if (messageSize == -1)
                     {
-                        sizeByte = packet->buffer.at(byteIdx);
-                        messageSize += (sizeByte & 0x7F) * multiplier;
-                        byteIdx++;
-
-                        multiplier *= 128;
-                        if (multiplier > 0x200000)
-                        {
-                            #ifdef DEBUG
-                            std::cout << "Malformed Remaining Length" << std::endl;
-                            #endif
-
-                            delete packet;
-                            return;
-                        }
+                        delete packet;
+                        continue;
                     }
-                    while ((sizeByte & 0x80));
 
-                    #ifdef DEBUG
-                    std::cout << "\nNEW MESSAGE\n";
-                    std::cout << "message size  = " << messageSize + byteIdx << "\n";
-                    std::cout << "message len   = " << messageSize << "\n";
-                    std::cout << "message type  = " << packet->message.type << std::endl;
-                    #endif
-
-                    packet->message.size = messageSize;
-
-                    // Save remaining bytes as message
-                    while (byteIdx < mqttMessageHeaderSize)
-                    {
-                        packet->message.data.push_back(packet->buffer.at(byteIdx));
-                        packet->message.offset++;
-                        byteIdx++;
-                    }
-                    packet->initialized = true;
+                    packet->message.size = static_cast<size_t>(messageSize);
 
                     // Request the next part of a message
-                    if (messageSize > 0) RequestMessage(packet, messageSize, ringBuffer);
+                    if (packet->message.size > 0) RequestMessage(packet, packet->message.size, ringBuffer);
                     else ProcessMessage(packet, cqe, ringBuffer, epollRegistry, connections);
                 }
                 else // Read message
@@ -441,6 +410,52 @@ namespace broker
             } // if
             io_uring_cqe_seen(ringBuffer, cqe);
         } // while
+    }
+
+    /**
+     * @brief Decode MQTT message length based on https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html.
+     *
+     * @param packet packet to decode message from.
+     */
+    ssize_t DecodeMessageLength(connection_packet_t *packet)
+    {
+        size_t messageSize = 0;
+        size_t multiplier = 1;
+        int byteIdx = 1;
+
+        uint8_t sizeByte;
+        do
+        {
+            sizeByte = packet->buffer.at(byteIdx);
+            messageSize += (sizeByte & 0x7F) * multiplier;
+            byteIdx++;
+
+            multiplier *= 128;
+            if (multiplier > 0x200000)
+            {
+                std::cerr << "Malformed Remaining Length" << std::endl;
+                return -1;
+            }
+        }
+        while ((sizeByte & 0x80));
+
+        #ifdef DEBUG
+        std::cout << "\nNEW MESSAGE\n";
+        std::cout << "message size  = " << messageSize + byteIdx << "\n";
+        std::cout << "message len   = " << messageSize << "\n";
+        std::cout << "message type  = " << packet->message.type << std::endl;
+        #endif
+
+        // Save remaining bytes as message
+        while (byteIdx < mqttMessageHeaderSize)
+        {
+            packet->message.data.push_back(packet->buffer.at(byteIdx));
+            packet->message.offset++;
+            byteIdx++;
+        }
+        packet->initialized = true;
+
+        return messageSize;
     }
 
     /**

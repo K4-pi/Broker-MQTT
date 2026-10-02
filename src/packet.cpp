@@ -19,6 +19,8 @@ MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message);
  *
  * @param packet Packet which has to be checked.
  * @return bool true if didn't excedeed Keep Alive time, false when exceeded.
+ *
+ * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html
  */
 bool CheckKeepAlive(connection_packet_t *packet)
 {
@@ -37,6 +39,8 @@ bool CheckKeepAlive(connection_packet_t *packet)
  *
  * @param fd Client socket file descriptor.
  * @return MESSAGE_STATUS OK on success, INVALID_VALUE on send failure.
+ *
+ * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html
  */
 static MESSAGE_STATUS MqttConnect(int fd)
 {
@@ -59,6 +63,8 @@ static MESSAGE_STATUS MqttConnect(int fd)
  *
  * @param fd Client socket file descriptor.
  * @return MESSAGE_STATUS OK on success, INVALID_VALUE on send failure.
+ *
+ * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html
  */
 static MESSAGE_STATUS MqttPing(int fd)
 {
