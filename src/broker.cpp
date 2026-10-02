@@ -165,8 +165,8 @@ namespace broker
             ThrowIfError(*listenSock, "listen_sock");
 
             const int enable = 1;
-            setsockopt(*listenSock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
-            ThrowIfError(bind(*listenSock, (sockaddr *)serverAddr, sizeof(*serverAddr)), "bind: listen_sock");
+            ThrowIfError(setsockopt(*listenSock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)), "setsockopt: listenSock");
+            ThrowIfError(bind(*listenSock, (sockaddr *)serverAddr, sizeof(*serverAddr)), "bind: listenSock");
             ThrowIfError(listen(*listenSock, 8), "listen");
 
             epollRegistry->epollFd = epoll_create1(0);
