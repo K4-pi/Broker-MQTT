@@ -416,6 +416,7 @@ namespace broker
      * @brief Decode MQTT message length based on https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html.
      *
      * @param packet packet to decode message from.
+     * @return -1 on error, messageSize on success.
      */
     ssize_t DecodeMessageLength(connection_packet_t *packet)
     {
