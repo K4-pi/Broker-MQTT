@@ -290,12 +290,6 @@ namespace broker
         struct io_uring *ringBuffer,
         struct connection_registry_t *connections)
     {
-        /* TODO:
-         * Needs change, we should check if user is already connected,
-         * if yes then we should access packet in hash map and request message for it
-         * and not create new connection_packet_t
-         */
-
         connection_packet_t* packet;
         try
         {
