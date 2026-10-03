@@ -4,7 +4,7 @@
 #include <sys/socket.h>
 
 #ifdef DEBUG
-#include "stdio.h"
+#include <iostream>
 #endif
 
 constexpr int keepAliveTimeSec = 10;
@@ -28,7 +28,7 @@ bool CheckKeepAlive(connection_packet_t *packet)
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds> (end - packet->keepAlive).count();
 
     #ifdef DEBUG
-    printf("Elapsed = %ld\n", elapsed);
+    std::cout << "[" << packet->fd << "] Elapsed = " << elapsed << std::endl;
     #endif
 
     return (elapsed >= keepAliveTimeSec) ? false : true;
@@ -52,7 +52,8 @@ static MESSAGE_STATUS MqttConnect(int fd)
     if (sent != static_cast<ssize_t>(sizeof(connack))) return FAILURE;
 
     #ifdef DEBUG
-    printf("Sent CONNACK\n");
+    std::cout << "Received CONNECT\n";
+    std::cout << "Sent CONNACK" << std::endl;
     #endif
 
     return OK;
@@ -75,7 +76,8 @@ static MESSAGE_STATUS MqttPing(int fd)
     if (sent != static_cast<ssize_t>(sizeof(pingresp))) return FAILURE;
 
     #ifdef DEBUG
-    printf("Sent PINGRESP\n");
+    std::cout << "Received PINGREQ\n";
+    std::cout << "Sent PINGRESP" << std::endl;
     #endif
 
     return OK;

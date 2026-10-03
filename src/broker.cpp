@@ -130,7 +130,7 @@ namespace broker
         }
 
         #ifdef DEBUG
-        std::cout << "client disconnected" << std::endl;
+        std::cout << "client with fd [" << clientFd << "] disconnected" << std::endl;
         #endif
     }
 
@@ -328,8 +328,12 @@ namespace broker
         size_t remaining = (packet->message.size > 0) ? (packet->message.size - packet->message.data.size()) : 0;
 
         #ifdef DEBUG
+        std::cout << "remaining size = " << remaining << "\n";
         for (uint8_t b : packet->message.data) printf("%.02X ", b);
-        std::cout << "\nremaining size = " << remaining << std::endl;
+        std::cout << "\nMsg: ";
+        if (packet->message.size > 0)
+            for (uint8_t b : packet->message.data) std::cout << b;
+        std::cout << std::endl;
         #endif
 
         if (remaining > 0) RequestMessage(packet, remaining, ringBuffer);
