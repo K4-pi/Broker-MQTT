@@ -34,6 +34,7 @@ enum MESSAGE_STATUS {
 
 struct message_accumulator_t {
     PACKET_TYPE type;
+    uint8_t flags; // Lower 4 bits of fixed header byte 1
     uint8_t offset;
     size_t size;
     std::vector<uint8_t> data;
@@ -47,5 +48,7 @@ struct connection_packet_t {
     std::chrono::time_point<std::chrono::steady_clock> keepAlive;
 };
 
-MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message);
+class Topic;
+
+MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message, Topic *topicsRoot);
 bool CheckKeepAlive(connection_packet_t *packet);

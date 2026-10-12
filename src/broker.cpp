@@ -26,6 +26,7 @@
 #include "netinet/in.h"
 #include "linux/io_uring.h"
 #include "liburing.h"
+#include "topics.hpp"
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
@@ -55,17 +56,19 @@ namespace broker
     );
     void ProcessMessage(
         connection_packet_t *packet,
-        io_uring_cqe *cqe,
+        size_t receivedBytes,
         struct io_uring *ringBuffer,
         struct epoll_registry_t *epollRegistry,
-        struct connection_registry_t *connections
+        struct connection_registry_t *connections,
+        Topic *topicsRoot
     );
     void ProcessPackets(
         struct io_uring *ringBuffer,
         struct epoll_registry_t *epollRegistry,
-        struct connection_registry_t *connections
+        struct connection_registry_t *connections,
+        Topic *topicsRoot
     );
-    ssize_t DecodeMessageLength(connection_packet_t *packet);
+    ssize_t DecodeMessageLength(connection_packet_t *packet, size_t receivedBytes);
     void ManagePacketLiveTime(
         epoll_registry_t *epollRegistry,
         connection_registry_t *connections
@@ -123,6 +126,8 @@ namespace broker
     )
     {
         epoll_ctl(epollRegistry->epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
+        // Pending io_uring recv keeps the socket referenced, close() alone would not end the connection
+        shutdown(clientFd, SHUT_RDWR);
         close(clientFd);
         {
             std::lock_guard<std::mutex> lock(connections->mutex);
@@ -204,6 +209,9 @@ namespace broker
         static boost::threadpool::pool workers(std::thread::hardware_concurrency());
         struct connection_registry_t connections;
 
+        Topic *root = InitTopicsTree();
+        // SaveTopic(root, "/device/home/temp_sensor");
+
         while (true)
         {
             ManagePacketLiveTime(&epollRegistry, &connections);
@@ -246,6 +254,7 @@ namespace broker
                 }
                 else
                 {
+                    bool isNewConnection = false;
                     {
                         std::lock_guard<std::mutex> lock(connections.mutex);
 
@@ -256,15 +265,19 @@ namespace broker
                             packet->keepAlive = std::chrono::steady_clock::now();
 
                             if (packet) connections.entries.emplace(fd, packet);
+                            isNewConnection = true;
                         }
                     }
 
-                    workers.schedule([fd, &ringBuffer, &connections]() {
-                        FdHandlerSubmit(fd, &ringBuffer, &connections);
-                    });
+                    if (isNewConnection)
+                    {
+                        workers.schedule([fd, &ringBuffer, &connections]() {
+                            FdHandlerSubmit(fd, &ringBuffer, &connections);
+                        });
+                    }
                 }
             } // for
-            ProcessPackets(&ringBuffer, &epollRegistry, &connections);
+            ProcessPackets(&ringBuffer, &epollRegistry, &connections, root);
         } // while (true)
     }
 
@@ -308,44 +321,45 @@ namespace broker
      * @brief Take actions based on ongoing message allocation.
      *
      * @param packet pointer to packet with processed message.
-     * @param cqe IO Completion Queue Entry
+     * @param receivedBytes number of bytes received into packet buffer.
      * @param ringBuffer IO uring buffer used to write/read data between client and broker.
      * @param epollRegistry epoll status.
      * @param connections currently connected clients.
+     * @param topicsRoot root of topics tree.
      */
     void ProcessMessage(
         connection_packet_t *packet,
-        io_uring_cqe *cqe,
+        size_t receivedBytes,
         struct io_uring *ringBuffer,
         struct epoll_registry_t *epollRegistry,
-        struct connection_registry_t *connections
+        struct connection_registry_t *connections,
+        Topic *topicsRoot
     )
     {
-        auto bytesToCopy = std::min<std::size_t>(packet->buffer.size(), static_cast<std::size_t>(cqe->res));
+        size_t remaining = packet->message.size - packet->message.data.size();
+
+        auto bytesToCopy = std::min<std::size_t>({packet->buffer.size(), receivedBytes, remaining});
         auto it = packet->buffer.begin();
         packet->message.data.insert(packet->message.data.end(), it, it + bytesToCopy);
-
-        size_t remaining = (packet->message.size > 0) ? (packet->message.size - packet->message.data.size()) : 0;
+        remaining -= bytesToCopy;
 
         #ifdef DEBUG
         std::cout << "remaining size = " << remaining << "\n";
         for (uint8_t b : packet->message.data) printf("%.02X ", b);
-        std::cout << "\nMsg: ";
-        if (packet->message.size > 0)
-            for (uint8_t b : packet->message.data) std::cout << b;
         std::cout << std::endl;
         #endif
 
         if (remaining > 0) RequestMessage(packet, remaining, ringBuffer);
         else
         {
-            MESSAGE_STATUS status = HandleMessageData(packet->fd, &packet->message);
+            MESSAGE_STATUS status = HandleMessageData(packet->fd, &packet->message, topicsRoot);
             switch (status) {
                 case OK: // Just clear packet for next possible message
                     packet->message.data.clear();
                     packet->message.size = 0;
                     packet->message.offset = 0;
                     packet->initialized = false;
+                    RequestMessage(packet, mqttMessageHeaderSize, ringBuffer);
                     break;
 
                 case FAILURE: // Disconnect on failure
@@ -353,15 +367,6 @@ namespace broker
                     delete packet;
                     break;
             };
-        }
-        if (packet)
-        {
-            struct io_uring_sqe *sqe = io_uring_get_sqe(ringBuffer);
-            if (sqe)
-            {
-                io_uring_sqe_set_data(sqe, packet);
-                io_uring_submit(ringBuffer);
-            }
         }
     }
 
@@ -373,11 +378,13 @@ namespace broker
      * @param ringBuffer IO uring buffer used to write/read data between client and broker.
      * @param epollRegistry epoll status.
      * @param connections currently connected clients.
+     * @param topicsRoot root of topics tree.
      */
     void ProcessPackets(
         struct io_uring *ringBuffer,
         struct epoll_registry_t *epollRegistry,
-        struct connection_registry_t *connections
+        struct connection_registry_t *connections,
+        Topic *topicsRoot
     )
     {
         struct io_uring_cqe *cqe;
@@ -390,8 +397,9 @@ namespace broker
                 {
                     packet->keepAlive = std::chrono::steady_clock::now();
                     packet->message.type = static_cast<PACKET_TYPE>(packet->buffer.at(0) >> 4);
+                    packet->message.flags = packet->buffer.at(0) & 0x0F;
 
-                    ssize_t messageSize = DecodeMessageLength(packet);
+                    ssize_t messageSize = DecodeMessageLength(packet, static_cast<size_t>(cqe->res));
                     if (messageSize == -1)
                     {
                         delete packet;
@@ -400,13 +408,12 @@ namespace broker
 
                     packet->message.size = static_cast<size_t>(messageSize);
 
-                    // Request the next part of a message
-                    if (packet->message.size > 0) RequestMessage(packet, packet->message.size, ringBuffer);
-                    else ProcessMessage(packet, cqe, ringBuffer, epollRegistry, connections);
+                    // Header bytes are already in message, request the rest or handle it if complete
+                    ProcessMessage(packet, 0, ringBuffer, epollRegistry, connections, topicsRoot);
                 }
                 else // Read message
                 {
-                    ProcessMessage(packet, cqe, ringBuffer, epollRegistry, connections);
+                    ProcessMessage(packet, static_cast<size_t>(cqe->res), ringBuffer, epollRegistry, connections, topicsRoot);
                 }
             } // if
             io_uring_cqe_seen(ringBuffer, cqe);
@@ -417,9 +424,10 @@ namespace broker
      * @brief Decode MQTT message length based on https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html.
      *
      * @param packet packet to decode message from.
+     * @param receivedBytes number of bytes received into packet buffer.
      * @return -1 on error, messageSize on success.
      */
-    ssize_t DecodeMessageLength(connection_packet_t *packet)
+    ssize_t DecodeMessageLength(connection_packet_t *packet, size_t receivedBytes)
     {
         size_t messageSize = 0;
         size_t multiplier = 1;
@@ -448,8 +456,9 @@ namespace broker
         std::cout << "message type  = " << packet->message.type << std::endl;
         #endif
 
-        // Save remaining bytes as message
-        while (byteIdx < mqttMessageHeaderSize)
+        // Save remaining received bytes as message, without going past its end
+        const size_t headerEnd = std::min<size_t>(receivedBytes, byteIdx + messageSize);
+        while (static_cast<size_t>(byteIdx) < headerEnd)
         {
             packet->message.data.push_back(packet->buffer.at(byteIdx));
             packet->message.offset++;
