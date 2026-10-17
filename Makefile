@@ -1,38 +1,21 @@
-CXX := g++
-CXXFLAGS := -Wall -Wextra -Wpedantic -std=c++20 -Iinclude -DDEBUG \
-	-DBOOST_BIND_GLOBAL_PLACEHOLDERS \
-	-D_GLIBCXX_DEBUG \
-	-Wno-volatile \
-	-Wno-catch-value \
-	-g
+CXX := g++ -std=c++20
+CXXFLAGS := -Wall -Wextra -Wpedantic -Iinclude \
+			-DBOOST_BIND_GLOBAL_PLACEHOLDERS -D_GLIBCXX_DEBUG \
+			-Wno-volatile -Wno-catch-value -g
 LDLIBS := -lboost_thread -luring -pthread
-SRC_DIR := src
-BUILD_DIR := build
-TARGET := $(BUILD_DIR)/broker-mqtt
 
-SRC_SOURCES := $(wildcard $(SRC_DIR)/*.cpp)
-ROOT_SOURCES := main.cpp
-OBJECTS := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(SRC_SOURCES)) \
-	$(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ROOT_SOURCES))
+# Add -DDEBUG to CXXFLAGS for debug prints/logs
 
-.PHONY: all run clean
+SOURCES := main.cpp $(wildcard src/*.cpp)
+TARGET := build/broker-mqtt
+
+.PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): $(OBJECTS)
+$(TARGET): $(SOURCES)
+	mkdir -p build
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDLIBS)
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/%.o: %.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
-
-run: $(TARGET)
-	./$(TARGET)
-
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf build
