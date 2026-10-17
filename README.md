@@ -2,11 +2,6 @@
 
 MQTT 3.1.1 broker written in C++20.
 
-```bash
-make
-make run
-```
-
 ## Technologies
 
 | Piece | Used for |
@@ -37,6 +32,12 @@ make run
 | Will messages | No |
 | Sessions kept after disconnect | No |
 | MQTT 5 | No |
+
+## Build
+
+```bash
+make
+```
 
 ## License
 
