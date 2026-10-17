@@ -2,10 +2,13 @@
 #include "topics.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <vector>
 
 #ifdef DEBUG
 #include <iostream>
@@ -13,13 +16,97 @@
 
 constexpr int keepAliveTimeSec = 10;
 
+// SUBACK return code telling the client a Topic Filter was rejected [MQTT-3.9.3-2]
+constexpr std::uint8_t subackFailure = 0x80;
+
 bool CheckKeepAlive(connection_packet_t *packet);
+static std::uint16_t NextPacketId();
+static MESSAGE_STATUS SendAll(int fd, const std::uint8_t *data, std::size_t size);
+static void EncodeRemainingLength(std::vector<std::uint8_t> &out, std::size_t length);
 static MESSAGE_STATUS MqttConnect(int fd);
 static MESSAGE_STATUS MqttPing(int fd);
-static MESSAGE_STATUS SendAck(int fd, PACKET_TYPE type, std::uint16_t packetId);
+static MESSAGE_STATUS SendAck(int fd, PACKET_TYPE type, std::uint16_t packetId, std::uint8_t flags = 0);
+static MESSAGE_STATUS SendSuback(int fd, std::uint16_t packetId, const std::vector<std::uint8_t> &returnCodes);
+static MESSAGE_STATUS SendPublish(
+    int fd,
+    std::string_view topic,
+    std::string_view payload,
+    std::uint8_t qos,
+    bool retain,
+    std::uint16_t packetId
+);
 static MESSAGE_STATUS MqttPublish(int fd, message_accumulator_t *message, Topic *topicsRoot);
 static MESSAGE_STATUS MqttPubrel(int fd, message_accumulator_t *message);
+static MESSAGE_STATUS MqttPubrec(int fd, message_accumulator_t *message);
+static MESSAGE_STATUS MqttDeliveryAck(message_accumulator_t *message);
+static MESSAGE_STATUS MqttSubscribe(int fd, message_accumulator_t *message, Topic *topicsRoot);
+static MESSAGE_STATUS MqttUnsubscribe(int fd, message_accumulator_t *message, Topic *topicsRoot);
 MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message, Topic *topicsRoot);
+
+/**
+ * @brief Hand out the next Packet Identifier for broker originated messages.
+ *
+ * @return std::uint16_t identifier, never 0 since that value is reserved [MQTT-2.3.1-1].
+ */
+static std::uint16_t NextPacketId()
+{
+    static std::uint16_t packetId = 0;
+
+    if (++packetId == 0) packetId = 1;
+
+    return packetId;
+}
+
+/**
+ * @brief Write a whole packet to a client socket.
+ *
+ * MSG_NOSIGNAL keeps a vanished subscriber from killing the broker with SIGPIPE.
+ * Client sockets are non-blocking and the broker has no outbound queue, so a full
+ * socket buffer is reported as a failure instead of being retried.
+ *
+ * @param fd Client socket file descriptor.
+ * @param data Bytes to send.
+ * @param size Number of bytes to send.
+ * @return MESSAGE_STATUS OK when everything was sent, FAILURE otherwise.
+ */
+static MESSAGE_STATUS SendAll(int fd, const std::uint8_t *data, std::size_t size)
+{
+    std::size_t sentTotal = 0;
+    while (sentTotal < size)
+    {
+        const ssize_t sent = send(fd, data + sentTotal, size - sentTotal, MSG_NOSIGNAL);
+        if (sent < 0)
+        {
+            if (errno == EINTR) continue;
+            return FAILURE;
+        }
+
+        sentTotal += static_cast<std::size_t>(sent);
+    }
+
+    return OK;
+}
+
+/**
+ * @brief Append a Remaining Length field in its variable length encoding.
+ *
+ * @param out packet being built.
+ * @param length number of bytes following the fixed header.
+ *
+ * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718023
+ */
+static void EncodeRemainingLength(std::vector<std::uint8_t> &out, std::size_t length)
+{
+    do
+    {
+        std::uint8_t encoded = length % 128;
+        length /= 128;
+        if (length > 0) encoded |= 0x80;
+
+        out.push_back(encoded);
+    }
+    while (length > 0);
+}
 
 /**
  * @brief Check Keep Alive time of a packet.
@@ -55,8 +142,7 @@ static MESSAGE_STATUS MqttConnect(int fd)
     // connect acknowledge flags (0x00), reason code success (0x00)
     constexpr std::uint8_t connack[] = {0x20, 0x02, 0x00, 0x00};
 
-    const ssize_t sent = send(fd, connack, sizeof(connack), 0);
-    if (sent != static_cast<ssize_t>(sizeof(connack))) return FAILURE;
+    if (SendAll(fd, connack, sizeof(connack)) == FAILURE) return FAILURE;
 
     #ifdef DEBUG
     std::cout << "Received CONNECT\n";
@@ -79,8 +165,7 @@ static MESSAGE_STATUS MqttPing(int fd)
     // PINGRESP: packet type (0xD0), remaining length (0x00)
     constexpr std::uint8_t pingresp[] = {0xD0, 0x00};
 
-    const ssize_t sent = send(fd, pingresp, sizeof(pingresp), 0);
-    if (sent != static_cast<ssize_t>(sizeof(pingresp))) return FAILURE;
+    if (SendAll(fd, pingresp, sizeof(pingresp)) == FAILURE) return FAILURE;
 
     #ifdef DEBUG
     std::cout << "Received PINGREQ\n";
@@ -91,27 +176,92 @@ static MESSAGE_STATUS MqttPing(int fd)
 }
 
 /**
- * @brief Send 4 byte acknowledge packet (PUBACK, PUBREC, PUBCOMP).
+ * @brief Send 4 byte acknowledge packet (PUBACK, PUBREC, PUBREL, PUBCOMP, UNSUBACK).
  *
  * @param fd Client socket file descriptor.
- * @param type Acknowledge packet type, its fixed header flags are always 0.
+ * @param type Acknowledge packet type.
  * @param packetId Packet Identifier being acknowledged.
+ * @param flags Lower 4 bits of the fixed header, 0 for every type except PUBREL.
  * @return MESSAGE_STATUS OK on success, FAILURE on send failure.
  */
-static MESSAGE_STATUS SendAck(int fd, PACKET_TYPE type, std::uint16_t packetId)
+static MESSAGE_STATUS SendAck(int fd, PACKET_TYPE type, std::uint16_t packetId, std::uint8_t flags)
 {
     // packet type in upper 4 bits, remaining length (0x02), packet identifier MSB, LSB
     const std::uint8_t ack[] = {
-        static_cast<std::uint8_t>(type << 4),
+        static_cast<std::uint8_t>((type << 4) | (flags & 0x0F)),
         0x02,
         static_cast<std::uint8_t>(packetId >> 8),
         static_cast<std::uint8_t>(packetId & 0xFF)
     };
 
-    const ssize_t sent = send(fd, ack, sizeof(ack), 0);
-    if (sent != static_cast<ssize_t>(sizeof(ack))) return FAILURE;
+    return SendAll(fd, ack, sizeof(ack));
+}
 
-    return OK;
+/**
+ * @brief Send MQTT 3.1.1 SUBACK packet.
+ *
+ * @param fd Client socket file descriptor.
+ * @param packetId Packet Identifier taken from the SUBSCRIBE packet.
+ * @param returnCodes One granted QoS or failure code per requested Topic Filter.
+ * @return MESSAGE_STATUS OK on success, FAILURE on send failure.
+ *
+ * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718068
+ */
+static MESSAGE_STATUS SendSuback(int fd, std::uint16_t packetId, const std::vector<std::uint8_t> &returnCodes)
+{
+    std::vector<std::uint8_t> packet;
+    packet.push_back(SUBACK << 4);
+
+    EncodeRemainingLength(packet, sizeof(packetId) + returnCodes.size());
+
+    packet.push_back(static_cast<std::uint8_t>(packetId >> 8));
+    packet.push_back(static_cast<std::uint8_t>(packetId & 0xFF));
+    packet.insert(packet.end(), returnCodes.begin(), returnCodes.end());
+
+    return SendAll(fd, packet.data(), packet.size());
+}
+
+/**
+ * @brief Send MQTT 3.1.1 PUBLISH packet to a subscriber.
+ *
+ * @param fd Subscriber socket file descriptor.
+ * @param topic Topic Name the message was published on.
+ * @param payload Application message.
+ * @param qos QoS level the message is delivered with.
+ * @param retain RETAIN flag, set only when replaying a stored message to a new subscription.
+ * @param packetId Packet Identifier, used only when @p qos is greater than 0.
+ * @return MESSAGE_STATUS OK on success, FAILURE on send failure.
+ *
+ * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718037
+ */
+static MESSAGE_STATUS SendPublish(
+    int fd,
+    std::string_view topic,
+    std::string_view payload,
+    std::uint8_t qos,
+    bool retain,
+    std::uint16_t packetId
+)
+{
+    const std::size_t packetIdSize = (qos > 0) ? sizeof(packetId) : 0;
+
+    std::vector<std::uint8_t> packet;
+    packet.push_back(static_cast<std::uint8_t>((PUBLISH << 4) | (qos << 1) | (retain ? 0x01 : 0x00)));
+    EncodeRemainingLength(packet, sizeof(std::uint16_t) + topic.size() + packetIdSize + payload.size());
+
+    packet.push_back(static_cast<std::uint8_t>(topic.size() >> 8));
+    packet.push_back(static_cast<std::uint8_t>(topic.size() & 0xFF));
+    packet.insert(packet.end(), topic.begin(), topic.end());
+
+    if (qos > 0)
+    {
+        packet.push_back(static_cast<std::uint8_t>(packetId >> 8));
+        packet.push_back(static_cast<std::uint8_t>(packetId & 0xFF));
+    }
+
+    packet.insert(packet.end(), payload.begin(), payload.end());
+
+    return SendAll(fd, packet.data(), packet.size());
 }
 
 /**
@@ -178,10 +328,19 @@ static MESSAGE_STATUS MqttPublish(int fd, message_accumulator_t *message, Topic 
 
     // TODO: for QoS 2 a duplicate must not be delivered to subscribers twice.
 
+    for (const subscription_t &subscriber : MatchSubscribers(topicsRoot, topic))
+    {
+        // Delivery uses the lower of the published and the subscribed QoS [MQTT-3.8.4-6]
+        const std::uint8_t deliveryQos = std::min(qos, subscriber.qos);
+        const std::uint16_t deliveryId = (deliveryQos > 0) ? NextPacketId() : 0;
+
+        // RETAIN is cleared on forwarded messages [MQTT-3.3.1-9], and one unreachable
+        // subscriber must not stop delivery to the remaining ones
+        SendPublish(subscriber.fd, topic, payload, deliveryQos, false, deliveryId);
+    }
+
     // Without RETAIN flag the message is not stored [MQTT-3.3.1-12].
     if (retain) SaveTopic(topicsRoot, topic, std::move(payload));
-
-    // TODO: forward message to topic subscribers once SUBSCRIBE is implemented.
 
     // QoS check: pick acknowledge for the given level
     switch (qos)
@@ -232,6 +391,179 @@ static MESSAGE_STATUS MqttPubrel(int fd, message_accumulator_t *message)
 }
 
 /**
+ * @brief Handle MQTT 3.1.1 PUBREC packet from a subscriber (QoS 2 flow) and respond with PUBREL.
+ *
+ * @param fd Client socket file descriptor.
+ * @param message Assembled PUBREC message.
+ * @return MESSAGE_STATUS OK on success, FAILURE on malformed packet or send failure.
+ *
+ * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718048
+ */
+static MESSAGE_STATUS MqttPubrec(int fd, message_accumulator_t *message)
+{
+    if (message->flags != 0) return FAILURE;
+    if (message->size != 2 || message->data.size() < 2) return FAILURE;
+
+    const std::uint16_t packetId = static_cast<std::uint16_t>((message->data[0] << 8) | message->data[1]);
+
+    #ifdef DEBUG
+    std::cout << "Received PUBREC id=" << packetId << "\n";
+    std::cout << "Sent PUBREL" << std::endl;
+    #endif
+
+    // PUBREL fixed header flags have to be 0b0010 [MQTT-3.6.1-1]
+    return SendAck(fd, PUBREL, packetId, 0x02);
+}
+
+/**
+ * @brief Accept PUBACK or PUBCOMP from a subscriber. In-flight ids are not tracked yet.
+ *
+ * @param message Assembled acknowledge message.
+ * @return MESSAGE_STATUS OK on success, FAILURE on malformed packet.
+ */
+static MESSAGE_STATUS MqttDeliveryAck(message_accumulator_t *message)
+{
+    if (message->flags != 0) return FAILURE;
+    if (message->size != 2 || message->data.size() < 2) return FAILURE;
+
+    return OK;
+}
+
+/**
+ * @brief Handle MQTT 3.1.1 SUBSCRIBE packet, respond with SUBACK, then send matching retained messages.
+ *
+ * @param fd Client socket file descriptor.
+ * @param message Assembled SUBSCRIBE message.
+ * @param topicsRoot root of topics tree.
+ * @return MESSAGE_STATUS OK on success, FAILURE on malformed packet or send failure.
+ *
+ * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718063
+ */
+static MESSAGE_STATUS MqttSubscribe(int fd, message_accumulator_t *message, Topic *topicsRoot)
+{
+    // Fixed header flags have to be 0b0010 [MQTT-3.8.1-1]
+    if (message->flags != 0x02) return FAILURE;
+
+    const std::size_t length = std::min(message->size, message->data.size());
+    const std::uint8_t *data = message->data.data();
+    std::size_t idx = 0;
+
+    if (length < 2) return FAILURE;
+    const std::uint16_t packetId = static_cast<std::uint16_t>((data[0] << 8) | data[1]);
+    idx += 2;
+
+    if (packetId == 0) return FAILURE;
+
+    // Payload must contain at least one Topic Filter [MQTT-3.8.3-3]
+    if (idx >= length) return FAILURE;
+
+    std::vector<std::uint8_t> returnCodes;
+    std::vector<std::string> acceptedFilters;
+    std::vector<std::uint8_t> acceptedQos;
+
+    while (idx < length)
+    {
+        if (idx + 2 > length) return FAILURE;
+
+        const std::size_t filterLength = (data[idx] << 8) | data[idx + 1];
+        idx += 2;
+
+        // Topic Filter followed by 1 byte Requested QoS
+        if (filterLength == 0 || idx + filterLength + 1 > length) return FAILURE;
+
+        const std::string_view filter(reinterpret_cast<const char *>(data + idx), filterLength);
+        idx += filterLength;
+
+        const std::uint8_t requested = data[idx++];
+        // Bits 7-2 reserved, must be 0; bits 1-0 are QoS 0, 1 or 2 [MQTT-3.8.3-4]
+        if ((requested & 0xFC) != 0 || (requested & 0x03) > 2) return FAILURE;
+
+        const std::uint8_t qos = requested & 0x03;
+        if (!IsValidTopicFilter(filter))
+        {
+            returnCodes.push_back(subackFailure);
+            continue;
+        }
+
+        SubscribeTopic(topicsRoot, filter, fd, qos);
+        returnCodes.push_back(qos);
+        acceptedFilters.emplace_back(filter);
+        acceptedQos.push_back(qos);
+    }
+
+    #ifdef DEBUG
+    std::cout << "Received SUBSCRIBE id=" << packetId
+              << " filters=" << returnCodes.size() << "\n";
+    std::cout << "Sent SUBACK" << std::endl;
+    #endif
+
+    if (SendSuback(fd, packetId, returnCodes) == FAILURE) return FAILURE;
+
+    // Matching retained messages are sent with RETAIN
+    for (std::size_t i = 0; i < acceptedFilters.size(); ++i)
+    {
+        for (const retained_message_t &retained : MatchRetained(topicsRoot, acceptedFilters[i]))
+        {
+            const std::uint16_t deliveryId = (acceptedQos[i] > 0) ? NextPacketId() : 0;
+            SendPublish(fd, retained.topic, retained.message, acceptedQos[i], true, deliveryId);
+        }
+    }
+
+    return OK;
+}
+
+/**
+ * @brief Handle MQTT 3.1.1 UNSUBSCRIBE packet and respond with UNSUBACK.
+ *
+ * @param fd Client socket file descriptor.
+ * @param message Assembled UNSUBSCRIBE message.
+ * @param topicsRoot root of topics tree.
+ * @return MESSAGE_STATUS OK on success, FAILURE on malformed packet or send failure.
+ *
+ * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718072
+ */
+static MESSAGE_STATUS MqttUnsubscribe(int fd, message_accumulator_t *message, Topic *topicsRoot)
+{
+    // Fixed header flags have to be 0b0010 [MQTT-3.10.1-1]
+    if (message->flags != 0x02) return FAILURE;
+
+    const std::size_t length = std::min(message->size, message->data.size());
+    const std::uint8_t *data = message->data.data();
+    std::size_t idx = 0;
+
+    if (length < 2) return FAILURE;
+    const std::uint16_t packetId = static_cast<std::uint16_t>((data[0] << 8) | data[1]);
+    idx += 2;
+
+    if (packetId == 0) return FAILURE;
+
+    // Payload must contain at least one Topic Filter [MQTT-3.10.3-2]
+    if (idx >= length) return FAILURE;
+
+    while (idx < length)
+    {
+        if (idx + 2 > length) return FAILURE;
+
+        const std::size_t filterLength = (data[idx] << 8) | data[idx + 1];
+        idx += 2;
+
+        if (filterLength == 0 || idx + filterLength > length) return FAILURE;
+
+        const std::string_view filter(reinterpret_cast<const char *>(data + idx), filterLength);
+        idx += filterLength;
+
+        UnsubscribeTopic(topicsRoot, filter, fd);
+    }
+
+    #ifdef DEBUG
+    std::cout << "Received UNSUBSCRIBE id=" << packetId << "\n";
+    std::cout << "Sent UNSUBACK" << std::endl;
+    #endif
+
+    return SendAck(fd, UNSUBACK, packetId);
+}
+
+/**
  * @brief Process assembled MQTT message.
  *
  * @param clientFd Client socket file descriptor.
@@ -254,6 +586,19 @@ MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message, T
 
         case PUBREL:
             return MqttPubrel(clientFd, message);
+
+        case PUBREC:
+            return MqttPubrec(clientFd, message);
+
+        case PUBACK:
+        case PUBCOMP:
+            return MqttDeliveryAck(message);
+
+        case SUBSCRIBE:
+            return MqttSubscribe(clientFd, message, topicsRoot);
+
+        case UNSUBSCRIBE:
+            return MqttUnsubscribe(clientFd, message, topicsRoot);
 
         case DISCONNECT:
             return FAILURE;

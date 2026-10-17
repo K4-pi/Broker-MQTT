@@ -71,7 +71,8 @@ namespace broker
     ssize_t DecodeMessageLength(connection_packet_t *packet, size_t receivedBytes);
     void ManagePacketLiveTime(
         epoll_registry_t *epollRegistry,
-        connection_registry_t *connections
+        connection_registry_t *connections,
+        Topic *topicsRoot
     );
     static void RequestMessage(
         connection_packet_t *packet,
@@ -81,7 +82,8 @@ namespace broker
     static void DisconnectClient(
         int clientFd,
         struct epoll_registry_t *epollRegistry,
-        struct connection_registry_t *connections
+        struct connection_registry_t *connections,
+        Topic *topicsRoot
     );
 
     /**
@@ -118,13 +120,16 @@ namespace broker
      * @param clientFd client connection file descriptor.
      * @param epollRegistry epoll status.
      * @param connections currently connected clients.
+     * @param topicsRoot root of topics tree.
      */
     static void DisconnectClient(
         int clientFd,
         struct epoll_registry_t *epollRegistry,
-        struct connection_registry_t *connections
+        struct connection_registry_t *connections,
+        Topic *topicsRoot
     )
     {
+        RemoveSubscriber(topicsRoot, clientFd);
         epoll_ctl(epollRegistry->epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
         // Pending io_uring recv keeps the socket referenced, close() alone would not end the connection
         shutdown(clientFd, SHUT_RDWR);
@@ -210,11 +215,10 @@ namespace broker
         struct connection_registry_t connections;
 
         Topic *root = InitTopicsTree();
-        // SaveTopic(root, "/device/home/temp_sensor");
 
         while (true)
         {
-            ManagePacketLiveTime(&epollRegistry, &connections);
+            ManagePacketLiveTime(&epollRegistry, &connections, root);
 
             int nFds = epoll_wait(epollRegistry.epollFd, epollRegistry.events, maxEvents, epollTimeoutMs);
             try
@@ -363,7 +367,7 @@ namespace broker
                     break;
 
                 case FAILURE: // Disconnect on failure
-                    DisconnectClient(packet->fd, epollRegistry, connections);
+                    DisconnectClient(packet->fd, epollRegistry, connections, topicsRoot);
                     delete packet;
                     break;
             };
@@ -474,10 +478,12 @@ namespace broker
      *
      * @param epollRegistry epoll status.
      * @param connections currently connected clients.
+     * @param topicsRoot root of topics tree.
      */
     void ManagePacketLiveTime(
         epoll_registry_t *epollRegistry,
-        connection_registry_t *connections
+        connection_registry_t *connections,
+        Topic *topicsRoot
     )
     {
         std::vector<connection_packet_t*> expiredPackets = std::vector<connection_packet_t*>();
@@ -493,7 +499,7 @@ namespace broker
         {
             for (auto &packet : expiredPackets)
             {
-                DisconnectClient(packet->fd, epollRegistry, connections);
+                DisconnectClient(packet->fd, epollRegistry, connections, topicsRoot);
                 delete packet;
             }
         }
