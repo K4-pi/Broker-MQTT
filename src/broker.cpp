@@ -30,6 +30,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -86,6 +87,39 @@ namespace broker
         Topic *topicsRoot
     );
 
+    struct pending_send_t {
+        RING_OP ringOp = RING_OP::SEND;
+        int fd = -1;
+        std::vector<std::uint8_t> data;
+    };
+
+    /**
+     * @brief Queue one outbound packet on the io_uring ring.
+     *
+     * The buffer stays alive until the send completion is seen.
+     *
+     * @param ring IO uring used for client reads and writes.
+     * @param fd Client socket file descriptor.
+     * @param data Packet bytes. Moved into the pending send.
+     * @return MESSAGE_STATUS OK when the send was queued, FAILURE when no SQE is available.
+     */
+    MESSAGE_STATUS QueueSend(io_uring *ring, int fd, std::vector<std::uint8_t> data)
+    {
+        pending_send_t *pending = new pending_send_t{RING_OP::SEND, fd, std::move(data)};
+
+        struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+        if (!sqe)
+        {
+            delete pending;
+            return FAILURE;
+        }
+
+        io_uring_prep_send(sqe, pending->fd, pending->data.data(), pending->data.size(), MSG_NOSIGNAL);
+        io_uring_sqe_set_data(sqe, pending);
+        io_uring_submit(ring);
+        return OK;
+    }
+
     /**
      * @brief Submit async recv request for the next message chunk.
      *
@@ -131,7 +165,6 @@ namespace broker
     {
         RemoveSubscriber(topicsRoot, clientFd);
         epoll_ctl(epollRegistry->epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
-        // Pending io_uring recv keeps the socket referenced, close() alone would not end the connection
         shutdown(clientFd, SHUT_RDWR);
         close(clientFd);
         {
@@ -242,6 +275,11 @@ namespace broker
                         socklen_t serverAddrLen = sizeof(serverAddr);
                         connectionSock = accept4(listenSock, (struct sockaddr *) &serverAddr, &serverAddrLen, SOCK_NONBLOCK);
                         ThrowIfError(connectionSock, "accept4");
+
+                        // Blocking socket so one io_uring send writes the packet instead of returning EAGAIN
+                        const int flags = fcntl(connectionSock, F_GETFL, 0);
+                        ThrowIfError(flags, "fcntl: F_GETFL");
+                        ThrowIfError(fcntl(connectionSock, F_SETFL, flags & ~O_NONBLOCK), "fcntl: F_SETFL");
 
                         epollRegistry.event.events = EPOLLIN | EPOLLET;
                         epollRegistry.event.data.fd = connectionSock;
@@ -356,7 +394,7 @@ namespace broker
         if (remaining > 0) RequestMessage(packet, remaining, ringBuffer);
         else
         {
-            MESSAGE_STATUS status = HandleMessageData(packet->fd, &packet->message, topicsRoot);
+            MESSAGE_STATUS status = HandleMessageData(packet->fd, &packet->message, topicsRoot, ringBuffer);
             switch (status) {
                 case OK: // Just clear packet for next possible message
                     packet->message.data.clear();
@@ -394,7 +432,17 @@ namespace broker
         struct io_uring_cqe *cqe;
         while (io_uring_peek_cqe(ringBuffer, &cqe) == 0)
         {
-            connection_packet_t *packet = (connection_packet_t *)io_uring_cqe_get_data(cqe);
+            void *data = io_uring_cqe_get_data(cqe);
+
+            // We check if it is data that we send so we don't process response
+            if (data && *static_cast<RING_OP *>(data) == RING_OP::SEND)
+            {
+                delete static_cast<pending_send_t *>(data);
+                io_uring_cqe_seen(ringBuffer, cqe);
+                continue;
+            }
+
+            connection_packet_t *packet = static_cast<connection_packet_t *>(data);
             if (cqe->res > 0 && packet) // cqe->res, read bytes
             {
                 if (!packet->initialized) // Uninitialized message, read Header

@@ -2,12 +2,10 @@
 #include "topics.hpp"
 
 #include <algorithm>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
-#include <sys/socket.h>
 #include <vector>
 
 #ifdef DEBUG
@@ -21,27 +19,27 @@ constexpr std::uint8_t subackFailure = 0x80;
 
 bool CheckKeepAlive(connection_packet_t *packet);
 static std::uint16_t NextPacketId();
-static MESSAGE_STATUS SendAll(int fd, const std::uint8_t *data, std::size_t size);
 static void EncodeRemainingLength(std::vector<std::uint8_t> &out, std::size_t length);
-static MESSAGE_STATUS MqttConnect(int fd);
-static MESSAGE_STATUS MqttPing(int fd);
-static MESSAGE_STATUS SendAck(int fd, PACKET_TYPE type, std::uint16_t packetId, std::uint8_t flags = 0);
-static MESSAGE_STATUS SendSuback(int fd, std::uint16_t packetId, const std::vector<std::uint8_t> &returnCodes);
+static MESSAGE_STATUS MqttConnect(int fd, io_uring *ring);
+static MESSAGE_STATUS MqttPing(int fd, io_uring *ring);
+static MESSAGE_STATUS SendAck(int fd, io_uring *ring, PACKET_TYPE type, std::uint16_t packetId, std::uint8_t flags = 0);
+static MESSAGE_STATUS SendSuback(int fd, io_uring *ring, std::uint16_t packetId, const std::vector<std::uint8_t> &returnCodes);
 static MESSAGE_STATUS SendPublish(
     int fd,
+    io_uring *ring,
     std::string_view topic,
     std::string_view payload,
     std::uint8_t qos,
     bool retain,
     std::uint16_t packetId
 );
-static MESSAGE_STATUS MqttPublish(int fd, message_accumulator_t *message, Topic *topicsRoot);
-static MESSAGE_STATUS MqttPubrel(int fd, message_accumulator_t *message);
-static MESSAGE_STATUS MqttPubrec(int fd, message_accumulator_t *message);
+static MESSAGE_STATUS MqttPublish(int fd, io_uring *ring, message_accumulator_t *message, Topic *topicsRoot);
+static MESSAGE_STATUS MqttPubrel(int fd, io_uring *ring, message_accumulator_t *message);
+static MESSAGE_STATUS MqttPubrec(int fd, io_uring *ring, message_accumulator_t *message);
 static MESSAGE_STATUS MqttDeliveryAck(message_accumulator_t *message);
-static MESSAGE_STATUS MqttSubscribe(int fd, message_accumulator_t *message, Topic *topicsRoot);
-static MESSAGE_STATUS MqttUnsubscribe(int fd, message_accumulator_t *message, Topic *topicsRoot);
-MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message, Topic *topicsRoot);
+static MESSAGE_STATUS MqttSubscribe(int fd, io_uring *ring, message_accumulator_t *message, Topic *topicsRoot);
+static MESSAGE_STATUS MqttUnsubscribe(int fd, io_uring *ring, message_accumulator_t *message, Topic *topicsRoot);
+MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message, Topic *topicsRoot, io_uring *ring);
 
 /**
  * @brief Hand out the next Packet Identifier for broker originated messages.
@@ -55,36 +53,6 @@ static std::uint16_t NextPacketId()
     if (++packetId == 0) packetId = 1;
 
     return packetId;
-}
-
-/**
- * @brief Write a whole packet to a client socket.
- *
- * MSG_NOSIGNAL keeps a vanished subscriber from killing the broker with SIGPIPE.
- * Client sockets are non-blocking and the broker has no outbound queue, so a full
- * socket buffer is reported as a failure instead of being retried.
- *
- * @param fd Client socket file descriptor.
- * @param data Bytes to send.
- * @param size Number of bytes to send.
- * @return MESSAGE_STATUS OK when everything was sent, FAILURE otherwise.
- */
-static MESSAGE_STATUS SendAll(int fd, const std::uint8_t *data, std::size_t size)
-{
-    std::size_t sentTotal = 0;
-    while (sentTotal < size)
-    {
-        const ssize_t sent = send(fd, data + sentTotal, size - sentTotal, MSG_NOSIGNAL);
-        if (sent < 0)
-        {
-            if (errno == EINTR) continue;
-            return FAILURE;
-        }
-
-        sentTotal += static_cast<std::size_t>(sent);
-    }
-
-    return OK;
 }
 
 /**
@@ -136,13 +104,13 @@ bool CheckKeepAlive(connection_packet_t *packet)
  *
  * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html
  */
-static MESSAGE_STATUS MqttConnect(int fd)
+static MESSAGE_STATUS MqttConnect(int fd, io_uring *ring)
 {
     // CONNACK: packet type (0x20), remaining length (0x02)
     // connect acknowledge flags (0x00), reason code success (0x00)
     constexpr std::uint8_t connack[] = {0x20, 0x02, 0x00, 0x00};
 
-    if (SendAll(fd, connack, sizeof(connack)) == FAILURE) return FAILURE;
+    if (broker::QueueSend(ring, fd, {connack, connack + sizeof(connack)}) == FAILURE) return FAILURE;
 
     #ifdef DEBUG
     std::cout << "Received CONNECT\n";
@@ -160,12 +128,12 @@ static MESSAGE_STATUS MqttConnect(int fd)
  *
  * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html
  */
-static MESSAGE_STATUS MqttPing(int fd)
+static MESSAGE_STATUS MqttPing(int fd, io_uring *ring)
 {
     // PINGRESP: packet type (0xD0), remaining length (0x00)
     constexpr std::uint8_t pingresp[] = {0xD0, 0x00};
 
-    if (SendAll(fd, pingresp, sizeof(pingresp)) == FAILURE) return FAILURE;
+    if (broker::QueueSend(ring, fd, {pingresp, pingresp + sizeof(pingresp)}) == FAILURE) return FAILURE;
 
     #ifdef DEBUG
     std::cout << "Received PINGREQ\n";
@@ -184,7 +152,7 @@ static MESSAGE_STATUS MqttPing(int fd)
  * @param flags Lower 4 bits of the fixed header, 0 for every type except PUBREL.
  * @return MESSAGE_STATUS OK on success, FAILURE on send failure.
  */
-static MESSAGE_STATUS SendAck(int fd, PACKET_TYPE type, std::uint16_t packetId, std::uint8_t flags)
+static MESSAGE_STATUS SendAck(int fd, io_uring *ring, PACKET_TYPE type, std::uint16_t packetId, std::uint8_t flags)
 {
     // packet type in upper 4 bits, remaining length (0x02), packet identifier MSB, LSB
     const std::uint8_t ack[] = {
@@ -194,7 +162,7 @@ static MESSAGE_STATUS SendAck(int fd, PACKET_TYPE type, std::uint16_t packetId, 
         static_cast<std::uint8_t>(packetId & 0xFF)
     };
 
-    return SendAll(fd, ack, sizeof(ack));
+    return broker::QueueSend(ring, fd, {ack, ack + sizeof(ack)});
 }
 
 /**
@@ -207,7 +175,7 @@ static MESSAGE_STATUS SendAck(int fd, PACKET_TYPE type, std::uint16_t packetId, 
  *
  * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718068
  */
-static MESSAGE_STATUS SendSuback(int fd, std::uint16_t packetId, const std::vector<std::uint8_t> &returnCodes)
+static MESSAGE_STATUS SendSuback(int fd, io_uring *ring, std::uint16_t packetId, const std::vector<std::uint8_t> &returnCodes)
 {
     std::vector<std::uint8_t> packet;
     packet.push_back(SUBACK << 4);
@@ -218,7 +186,7 @@ static MESSAGE_STATUS SendSuback(int fd, std::uint16_t packetId, const std::vect
     packet.push_back(static_cast<std::uint8_t>(packetId & 0xFF));
     packet.insert(packet.end(), returnCodes.begin(), returnCodes.end());
 
-    return SendAll(fd, packet.data(), packet.size());
+    return broker::QueueSend(ring, fd, std::move(packet));
 }
 
 /**
@@ -236,6 +204,7 @@ static MESSAGE_STATUS SendSuback(int fd, std::uint16_t packetId, const std::vect
  */
 static MESSAGE_STATUS SendPublish(
     int fd,
+    io_uring *ring,
     std::string_view topic,
     std::string_view payload,
     std::uint8_t qos,
@@ -261,7 +230,7 @@ static MESSAGE_STATUS SendPublish(
 
     packet.insert(packet.end(), payload.begin(), payload.end());
 
-    return SendAll(fd, packet.data(), packet.size());
+    return broker::QueueSend(ring, fd, std::move(packet));
 }
 
 /**
@@ -274,7 +243,7 @@ static MESSAGE_STATUS SendPublish(
  *
  * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718037
  */
-static MESSAGE_STATUS MqttPublish(int fd, message_accumulator_t *message, Topic *topicsRoot)
+static MESSAGE_STATUS MqttPublish(int fd, io_uring *ring, message_accumulator_t *message, Topic *topicsRoot)
 {
     // Fixed header flags: bit 3 = DUP, bits 2-1 = QoS, bit 0 = RETAIN
     const bool dup          = (message->flags >> 3) & 0x01;
@@ -336,7 +305,7 @@ static MESSAGE_STATUS MqttPublish(int fd, message_accumulator_t *message, Topic 
 
         // RETAIN is cleared on forwarded messages [MQTT-3.3.1-9], and one unreachable
         // subscriber must not stop delivery to the remaining ones
-        SendPublish(subscriber.fd, topic, payload, deliveryQos, false, deliveryId);
+        SendPublish(subscriber.fd, ring, topic, payload, deliveryQos, false, deliveryId);
     }
 
     // Without RETAIN flag the message is not stored [MQTT-3.3.1-12].
@@ -352,13 +321,13 @@ static MESSAGE_STATUS MqttPublish(int fd, message_accumulator_t *message, Topic 
             #ifdef DEBUG
             std::cout << "Sent PUBACK" << std::endl;
             #endif
-            return SendAck(fd, PUBACK, packetId);
+            return SendAck(fd, ring, PUBACK, packetId);
 
         case 2: // Exactly once, respond with PUBREC, client continues with PUBREL
             #ifdef DEBUG
             std::cout << "Sent PUBREC" << std::endl;
             #endif
-            return SendAck(fd, PUBREC, packetId);
+            return SendAck(fd, ring, PUBREC, packetId);
 
         default:
             return FAILURE;
@@ -374,7 +343,7 @@ static MESSAGE_STATUS MqttPublish(int fd, message_accumulator_t *message, Topic 
  *
  * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718053
  */
-static MESSAGE_STATUS MqttPubrel(int fd, message_accumulator_t *message)
+static MESSAGE_STATUS MqttPubrel(int fd, io_uring *ring, message_accumulator_t *message)
 {
     // Fixed header flags have to be 0b0010 [MQTT-3.6.1-1]
     if (message->flags != 0x02) return FAILURE;
@@ -387,7 +356,7 @@ static MESSAGE_STATUS MqttPubrel(int fd, message_accumulator_t *message)
     std::cout << "Sent PUBCOMP" << std::endl;
     #endif
 
-    return SendAck(fd, PUBCOMP, packetId);
+    return SendAck(fd, ring, PUBCOMP, packetId);
 }
 
 /**
@@ -399,7 +368,7 @@ static MESSAGE_STATUS MqttPubrel(int fd, message_accumulator_t *message)
  *
  * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718048
  */
-static MESSAGE_STATUS MqttPubrec(int fd, message_accumulator_t *message)
+static MESSAGE_STATUS MqttPubrec(int fd, io_uring *ring, message_accumulator_t *message)
 {
     if (message->flags != 0) return FAILURE;
     if (message->size != 2 || message->data.size() < 2) return FAILURE;
@@ -412,7 +381,7 @@ static MESSAGE_STATUS MqttPubrec(int fd, message_accumulator_t *message)
     #endif
 
     // PUBREL fixed header flags have to be 0b0010 [MQTT-3.6.1-1]
-    return SendAck(fd, PUBREL, packetId, 0x02);
+    return SendAck(fd, ring, PUBREL, packetId, 0x02);
 }
 
 /**
@@ -439,7 +408,7 @@ static MESSAGE_STATUS MqttDeliveryAck(message_accumulator_t *message)
  *
  * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718063
  */
-static MESSAGE_STATUS MqttSubscribe(int fd, message_accumulator_t *message, Topic *topicsRoot)
+static MESSAGE_STATUS MqttSubscribe(int fd, io_uring *ring, message_accumulator_t *message, Topic *topicsRoot)
 {
     // Fixed header flags have to be 0b0010 [MQTT-3.8.1-1]
     if (message->flags != 0x02) return FAILURE;
@@ -497,7 +466,7 @@ static MESSAGE_STATUS MqttSubscribe(int fd, message_accumulator_t *message, Topi
     std::cout << "Sent SUBACK" << std::endl;
     #endif
 
-    if (SendSuback(fd, packetId, returnCodes) == FAILURE) return FAILURE;
+    if (SendSuback(fd, ring, packetId, returnCodes) == FAILURE) return FAILURE;
 
     // Matching retained messages are sent with RETAIN
     for (std::size_t i = 0; i < acceptedFilters.size(); ++i)
@@ -505,7 +474,7 @@ static MESSAGE_STATUS MqttSubscribe(int fd, message_accumulator_t *message, Topi
         for (const retained_message_t &retained : MatchRetained(topicsRoot, acceptedFilters[i]))
         {
             const std::uint16_t deliveryId = (acceptedQos[i] > 0) ? NextPacketId() : 0;
-            SendPublish(fd, retained.topic, retained.message, acceptedQos[i], true, deliveryId);
+            SendPublish(fd, ring, retained.topic, retained.message, acceptedQos[i], true, deliveryId);
         }
     }
 
@@ -522,7 +491,7 @@ static MESSAGE_STATUS MqttSubscribe(int fd, message_accumulator_t *message, Topi
  *
  * https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718072
  */
-static MESSAGE_STATUS MqttUnsubscribe(int fd, message_accumulator_t *message, Topic *topicsRoot)
+static MESSAGE_STATUS MqttUnsubscribe(int fd, io_uring *ring, message_accumulator_t *message, Topic *topicsRoot)
 {
     // Fixed header flags have to be 0b0010 [MQTT-3.10.1-1]
     if (message->flags != 0x02) return FAILURE;
@@ -560,7 +529,7 @@ static MESSAGE_STATUS MqttUnsubscribe(int fd, message_accumulator_t *message, To
     std::cout << "Sent UNSUBACK" << std::endl;
     #endif
 
-    return SendAck(fd, UNSUBACK, packetId);
+    return SendAck(fd, ring, UNSUBACK, packetId);
 }
 
 /**
@@ -569,36 +538,36 @@ static MESSAGE_STATUS MqttUnsubscribe(int fd, message_accumulator_t *message, To
  * @param clientFd Client socket file descriptor.
  * @return message pointer to handled message.
  */
-MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message, Topic *topicsRoot)
+MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message, Topic *topicsRoot, io_uring *ring)
 {
     if (!message) return FAILURE;
 
     switch (message->type)
     {
         case CONNECT:
-            return MqttConnect(clientFd);
+            return MqttConnect(clientFd, ring);
 
         case PINGREQ:
-            return MqttPing(clientFd);
+            return MqttPing(clientFd, ring);
 
         case PUBLISH:
-            return MqttPublish(clientFd, message, topicsRoot);
+            return MqttPublish(clientFd, ring, message, topicsRoot);
 
         case PUBREL:
-            return MqttPubrel(clientFd, message);
+            return MqttPubrel(clientFd, ring, message);
 
         case PUBREC:
-            return MqttPubrec(clientFd, message);
+            return MqttPubrec(clientFd, ring, message);
 
         case PUBACK:
         case PUBCOMP:
             return MqttDeliveryAck(message);
 
         case SUBSCRIBE:
-            return MqttSubscribe(clientFd, message, topicsRoot);
+            return MqttSubscribe(clientFd, ring, message, topicsRoot);
 
         case UNSUBSCRIBE:
-            return MqttUnsubscribe(clientFd, message, topicsRoot);
+            return MqttUnsubscribe(clientFd, ring, message, topicsRoot);
 
         case DISCONNECT:
             return FAILURE;

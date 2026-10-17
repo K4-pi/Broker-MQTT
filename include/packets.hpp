@@ -32,6 +32,14 @@ enum MESSAGE_STATUS {
     FAILURE
 };
 
+// First field of every io_uring user-data object, so a completion can tell a recv from a send
+enum class RING_OP : std::uint8_t {
+    RECV,
+    SEND
+};
+
+struct io_uring;
+
 struct message_accumulator_t {
     PACKET_TYPE type;
     uint8_t flags; // Lower 4 bits of fixed header byte 1
@@ -41,6 +49,7 @@ struct message_accumulator_t {
 };
 
 struct connection_packet_t {
+    RING_OP ringOp = RING_OP::RECV;
     int fd;
     bool initialized = false;
     std::array<uint8_t, packetBufferSize> buffer{};
@@ -50,5 +59,10 @@ struct connection_packet_t {
 
 class Topic;
 
-MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message, Topic *topicsRoot);
+namespace broker
+{
+    MESSAGE_STATUS QueueSend(io_uring *ring, int fd, std::vector<std::uint8_t> data);
+}
+
+MESSAGE_STATUS HandleMessageData(int clientFd, message_accumulator_t *message, Topic *topicsRoot, io_uring *ring);
 bool CheckKeepAlive(connection_packet_t *packet);
